@@ -1,0 +1,1095 @@
+```{r load_data}
+
+.libPaths("/home/users/allstaff/lu.t/R/x86_64-pc-linux-gnu-library/4.4")
+devtools::load_all("~/new_spaMTP/SpaMTP")
+
+library(ggplot2)
+library(ClusterR)
+library(dplyr)
+library(png)
+library(reshape2)
+library(rlist)
+library(parallel)
+library(maditr)
+library(Cardinal)
+library(RaMP)
+library(dplyr)
+library(stringr)
+library(svglite)
+library(readxl)
+
+
+
+sample_name = "lc_tissue"
+
+######### Reading files
+
+source_dir = "/stornext/Bioinf/data/lab_brain_cancer/projects/clinical_trials/trial_anheart/data/M/data"
+first_lc_tissue = read.csv(paste0(
+  source_dir,"/218001_003_004_005/data/tissue_LCMS_MA.csv"
+))
+colnames(first_lc_tissue)[1] = "compound"
+source_dir = "/stornext/Bioinf/data/lab_brain_cancer/projects/clinical_trials/trial_anheart/data/M/data"
+second_lc_tissue = read.csv(paste0(
+  source_dir,"/218006_007_008/data/LCMS/tissue_LCMS.csv"
+))
+colnames(second_lc_tissue)[1] = "compound"
+
+#View(first_lc_tissue)
+# xlsx_data
+# 3 columns: compound (sample name), variable(metabolites). and value
+# xlsx_data = first_lc_tissue
+#  sample_name = "gc_tissue"
+# #
+# # ######### Reading files
+# #
+#  source_dir = "/stornext/Bioinf/data/lab_brain_cancer/projects/clinical_trials/trial_anheart/data/M/data"
+#  first_lc_tissue = read.csv(paste0(
+#    source_dir,"/218001_003_004_005/data/GCMS/MA-JW-546_GCMS_Tissue_Metaboanalyst.csv"
+#  ))
+#  colnames(first_lc_tissue)[1] = "compound"
+#  source_dir = "/stornext/Bioinf/data/lab_brain_cancer/projects/clinical_trials/trial_anheart/data/M/data"
+#  second_lc_tissue = read.csv(paste0(
+#    source_dir,"/218006_007_008/data/GCMS/MA-SB-704_GCMS_Tissue_Batch2_Metaboanalyst.csv"
+#  ))[,-1]
+#  colnames(second_lc_tissue)[1] = "compound"
+#  second_lc_tissue = second_lc_tissue[which((grepl(second_lc_tissue$compound,
+#                                                   pattern  = "bx",
+#                                                   ignore.case =T)|
+#                                               grepl(second_lc_tissue$compound,
+#                                                     pattern = "04",
+#                                                     ignore.case =T))&
+#                                              grepl(second_lc_tissue$compound,
+#                                                    pattern  = "SB704_T[0-9]",
+#                                                    ignore.case =T)
+#  ),]
+
+
+gc_tissue = openxlsx::read.xlsx("~/anheart/MA-SB-847_LCMS_Polar Analysis_Tissue_IDX1.xlsx",
+                                sheet = "LC_Matrix_Tissue_IDX1") 
+
+colnames(gc_tissue)[1] = "compound"
+colnames(gc_tissue)[2:ncol(gc_tissue)] = paste0(colnames(gc_tissue)[2:ncol(gc_tissue)],"_",gc_tissue[1,2:ncol(gc_tissue)])
+
+colnames(gc_tissue) = sub("_[0-9][0-9]_","",colnames(gc_tissue))
+
+data_entry = gc_tissue[which(grepl(gc_tissue$compound,
+                                             pattern = "_T[0-9][0-9]")),]
+data_entry = data_entry[, !duplicated(colnames(gc_tissue))]
+# c("A-01_Surgery","A-01_Biopsy",
+#                            "O-01_Surgery","O-01_Biopsy",
+#                              "A-02_Surgery","A-02_Biopsy",
+#                              "A-03_Surgery","A-03_Biopsy",
+#                             "O-02_Surgery","O-02_Biopsy",
+#                            "A-04_Surgery","A-04_Biopsy",
+#                             "A-05_Surgery","A-05_Biopsy",
+#                             "A-06_Surgery","A-06_Biopsy",
+#                             "O-05_Surgery","O-05_Biopsy",
+#                             "A-07_Surgery","A-07_Biopsy")
+data_entry = data_entry %>% mutate(patient_status = c("A-01_Surgery","A-01_Biopsy",
+                           "O-01_Surgery","O-01_Biopsy",
+                             "A-02_Surgery","A-02_Biopsy",
+                             "A-03_Surgery","A-03_Biopsy",
+                            "O-02_Surgery","O-02_Biopsy",
+                           "A-04_Surgery","A-04_Biopsy",
+                            "A-05_Surgery","A-05_Biopsy",
+                            "A-06_Surgery","A-06_Biopsy",
+                            "O-05_Surgery","O-05_Biopsy",
+                            "A-07_Surgery","A-07_Biopsy"))%>% rowwise() %>% mutate(sample_type = ifelse(grepl(compound,pattern = "Bx",ignore.case = T),"Prior_treatment","Post_treatment")) %>%
+  mutate(patient_num = str_extract(compound, pattern = "0[0-9][0-9]")) %>% filter(patient_num != "007") 
+ 
+
+# (1) Pre-treatment index
+pre_index = which(grepl(data_entry$compound,pattern = "Bx",ignore.case = T))
+# (2) Post-treatment index 
+post_index = which(!grepl(data_entry$compound,pattern = "Bx",ignore.case = T))
+```
+
+```{r helperfunctions}
+convert_xlsx_to_plotdf = function(xlsx_data){
+  raw_df = reshape2::melt(xlsx_data) %>% mutate(patientnum = str_extract(compound, pattern = "0[0-9][0-9]")) %>%
+    mutate(status = ifelse(grepl(compound, pattern = "Bx"),
+                           "Biopsy","Surgery")) %>%
+    mutate(metabolites = sub("_HMDB.*$", "", variable))
+  
+  plot_df = data.frame()
+  for(i in 1: length(unique(raw_df$metabolites))){
+    metabolite = unique(raw_df$metabolites)[i]
+    sub_df = raw_df[which(raw_df$metabolites == metabolite ),]
+    sub_df_biopsy = sub_df[which(
+      sub_df$status =="Biopsy" ),]
+    sub_df_srugery= sub_df[which(
+      sub_df$status =="Surgery" ),]
+    merged_surgery_biopsy = merge( sub_df_biopsy,
+                                   sub_df_srugery,
+                                   by = "patientnum")
+    if(any(is.na(c(merged_surgery_biopsy$value.x,
+                   merged_surgery_biopsy$value.y)))){
+      next
+    }
+    plot_df = rbind(plot_df,
+                    merged_surgery_biopsy)
+  }
+  return(plot_df)
+}
+# unfiltered_table = combined_lc_tissue_data
+filter_against_non_significant_metabolures = function(unfiltered_table,
+                                                      all_info = F){
+  unique_met = unique(unfiltered_table$metabolites.x)
+  return_table = data.frame()
+  for(i in 1:length(unique_met)){
+    sub_table = unfiltered_table[which(unfiltered_table$metabolites.x == unique_met[i]),]
+    test = t.test(as.numeric(sub_table$value.x),as.numeric(sub_table$value.y),
+                  paired = TRUE,
+                  alternative = "two.sided",
+                  na.action = na.omit)
+    
+    if(test$p.value<=0.05){
+      return_sub = sub_table %>% mutate(p_val = test$p.value) %>%
+        mutate(expected_diff = test$estimate)
+      return_table = rbind(return_table,
+                           return_sub)
+    }else if(all_info ==T){
+      return_sub = sub_table %>% mutate(p_val = test$p.value) %>%
+        mutate(expected_diff = test$estimate)
+      return_table = rbind(return_table,
+                           return_sub)
+    }else{
+      next
+    }
+  }
+  return(return_table)
+}
+##### Plot
+disassemble_data = function(combined_data){
+  replicated_colname = gsub("\\.[xy]$", "",colnames(combined_data))
+  index_replicated = which(duplicated(replicated_colname))
+  name_non_replicated = unique(replicated_colname)[which(!unique(replicated_colname) %in% replicated_colname[index_replicated])]
+  index_non_replicated = c(1:ncol(combined_data))[-c(which(replicated_colname %in% name_non_replicated),
+                                                     index_replicated)]
+  
+  
+  patient_surgery = cbind(combined_data[,which(replicated_colname %in% name_non_replicated)],
+                          combined_data[,index_replicated])
+  colnames(patient_surgery) = gsub("\\.[xy]$", "",colnames(patient_surgery))
+  #
+  patient_biopsy = cbind(combined_data[,which(replicated_colname %in% name_non_replicated)],
+                         combined_data[,index_non_replicated])
+  colnames(patient_biopsy) = gsub("\\.[xy]$", "",colnames(  patient_biopsy))
+  
+  return_df = rbind(patient_surgery,
+                    patient_biopsy)
+  return(return_df)
+}
+```
+
+```{r cleaned}
+# Cleaning plot_df
+# plot_df = plot_df %>% rowwise() %>%mutate(fc =ifelse(any(is.na(c(value.y,value.x))),NA,(as.numeric(value.y)-as.numeric(value.x))/as.numeric(value.x )))
+# plot_df = plot_df[-which(as.numeric(plot_df$fc) == max(as.numeric(plot_df$fc),
+#                                                        na.omit =T)),]
+# plot_df = plot_df[-which(as.numeric(plot_df$fc)  == max(as.numeric(plot_df$fc),
+#                                                         na.omit =T)),]
+
+# Top/down 25%
+quantile_25 = quantile(probs = c(0.25,0.75),clean_lc_tissue$expected_diff,
+                       na.omit = T)
+
+# clean_lc_tissue = clean_lc_tissue[which(clean_lc_tissue$expected_diff<=quantile_25[1] |
+#                                           clean_lc_tissue$expected_diff>=quantile_25[2] ),]
+heatmap_df = data_entry
+#colnames(heatmap_df)[2:ncol(data_entry)] = sub("_HMDB.*", "", sub("-[0-9]?[a-z]?TMS.*", "", paste0(colnames(heatmap_df)[2:ncol(data_entry)])))
+View(heatmap_df)
+heatmap_df[, 2:(ncol(heatmap_df)-3)] = sapply(heatmap_df[, 2:(ncol(heatmap_df)-3)], as.numeric)
+standard_clean_lc = data.frame()
+heatmap_plotdf = convert_xlsx_to_plotdf(as.data.frame(heatmap_df)[, -c(ncol(heatmap_df) -
+                                                                         1, ncol(heatmap_df))])
+# (3) Cleaned against non-significant metabolites
+clean_lc_tissue = filter_against_non_significant_metabolures(heatmap_plotdf , all_info = T) %>% mutate(variable.x = sub("X", "", variable.x, fixed = TRUE)) %>% mutate(variable.y = sub("X", "", variable.y, fixed = TRUE))
+
+clean_lc_tissue = filter_against_non_significant_metabolures(heatmap_plotdf , all_info = T) %>% mutate(variable.x = sub("X", "", variable.x, fixed = TRUE)) %>% mutate(variable.y = sub("X", "", variable.y, fixed = TRUE))
+
+clean_lc_tissue = clean_lc_tissue %>% mutate(diff = value.y - value.x)
+clean_lc_tissue$variable.x = sub(".*_", "", clean_lc_tissue$variable.x)
+clean_lc_tissue$variable.y = sub(".*_", "", clean_lc_tissue$variable.y)
+standard_clean_lc = data.frame()
+for (i in 1:length(unique(clean_lc_tissue$metabolites.x))) {
+  subdt = clean_lc_tissue[which(clean_lc_tissue$metabolites.x == unique(clean_lc_tissue$metabolites.x)[i]), ]
+  subdt =  cbind(subdt, z_score = scale(subdt$diff))
+  standard_clean_lc  = rbind(standard_clean_lc , subdt)
+}
+
+standard_clean_lc$value.x = abs(standard_clean_lc$value.x)
+standard_clean_lc$value.y = abs(standard_clean_lc$value.y)
+#standard_clean_lc$metabolites.x = sub("X", "", standard_clean_lc$metabolites.x)
+standard_clean_lc =  standard_clean_lc %>% mutate(log_diff = log(value.y+1) -
+                                                    log(value.x+1))
+
+
+summary_data <- standard_clean_lc %>%
+  group_by(metabolites.x) %>%
+  dplyr::summarize(
+    mean = mean(log_diff),
+    se = sd(log_diff) / sqrt(n()),
+    colour = ifelse(mean(log_diff) >= 0, "red", "blue"),
+    sourceId = variable.x
+  )
+summary_data  = unique(summary_data )
+summary_data$metabolites.x <- factor(summary_data$metabolites.x, levels = summary_data$metabolites.x)
+
+
+
+```
+
+```{r}
+colour_m = data.frame(cbind(
+  colors = c(
+"#00FFFF",
+"#FF2400",
+"#6A5ACD",
+"#008080",
+"#FFD700",
+"#228B22",
+"#4B0082",
+"#90EE90",
+"#FF7F50",
+"#8F00FF"
+  ),
+  patient_num = c(
+    "001",
+    "003",
+    "004",
+    "005",
+    "006",
+    "007",
+    "008",
+    "009",
+    "011",
+    "012"
+  ),
+patient_index = c("A-01",
+                      "O-01",
+                      "A-02",
+                      "A-03",
+                      "O-02",
+                      "A-04",
+                      "A-05",
+                      "A-06",
+                      "O-05",
+                      "A-07")
+))
+
+colors_pat = c(
+"#00FFFF",
+"#FF2400",
+"#6A5ACD",
+"#008080",
+"#FFD700",
+"#228B22",
+"#4B0082",
+"#90EE90",
+"#FF7F50",
+"#8F00FF"
+)
+names(colors_pat) = c("001",
+                      "003",
+                      "004",
+                      "005",
+                      "006",
+                      "007",
+                      "008",
+                      "009",
+                      "011",
+                      "012")
+names(colors_pat) = c("A-01",
+                      "O-01",
+                      "A-02",
+                      "A-03",
+                      "O-02",
+                      "A-04",
+                      "A-05",
+                      "A-06",
+                      "O-05",
+                      "A-07")
+colour_new = rbind(colour_m %>% mutate(patient_num = paste0(patient_num,"Biopsy"))%>% arrange(patient_index),
+                   colour_m %>% mutate(patient_num = paste0(patient_num,"Surgery"))%>% arrange(patient_index))
+colour_new = colour_new %>% mutate(num = str_extract(patient_num,
+                                                                                    pattern = "[0-9][0-9][0-9]")) %>% mutate(type =
+                                                                                                                               sub("[0-9][0-9][0-9]","",patient_num)) %>% group_by(patient_index) %>% arrange((type))
+
+clean_lc_tissue = na.omit(clean_lc_tissue)
+
+disassembled_lc_t = disassemble_data(clean_lc_tissue) %>% mutate("Patient_sample" = paste0(patientnum,
+                                                                                           status)) %>% mutate(metabolites =
+                                                                                                                 sub("X", "", metabolites)) %>% rowwise() %>%
+  mutate(colours = colour_m$colors[which(colour_m$patient_num == patientnum)])
+3
+disassembled_lc_tissue = data.frame()
+for (i in 1:length(unique(disassembled_lc_t$metabolites))) {
+  subdt = disassembled_lc_t[which(disassembled_lc_t$metabolites == unique(disassembled_lc_t$metabolites)[i]), ]
+  subdt =  cbind(subdt, z_score = scale(subdt$value))
+  disassembled_lc_tissue = rbind(disassembled_lc_tissue,
+                                 subdt)
+}
+disassembled_lc_tissue  = disassembled_lc_tissue  %>% mutate(hmdb_Id = sub(".*_","",variable))
+
+
+summary_data <- standard_clean_lc %>%
+  group_by(metabolites.x) %>%
+  dplyr::summarize(
+    mean = mean(log_diff),
+    se = sd(log_diff) / sqrt(n()),
+    colour = ifelse(mean(log_diff) >= 0, "red", "blue")
+  )
+summary_data= unique(summary_data)
+summary_data$metabolites.x <- factor(summary_data$metabolites.x, levels = summary_data$metabolites.x)
+temp_clean_lc = clean_lc_tissue %>% filter(!duplicated(metabolites.x))
+summary_data = summary_data %>% rowwise() %>% mutate(hmdb_id = temp_clean_lc $variable.x[which(temp_clean_lc$metabolites.x == metabolites.x)])
+summary_data = summary_data %>% mutate(sourceId = paste0("hmdb:", hmdb_id))
+```
+
+
+
+
+
+```{r gettingpathways}
+################################################################################
+gethmdb_id = function(xlsx){
+  return(sub(".*HMDB", "HMDB", colnames(xlsx)))
+}
+
+
+
+
+################################################################################
+# pkg.globals <- RaMP::setConnectionToRaMP(
+#   dbname = "ramp", username = "root", conpass = "ADMIN",
+#   host = "localhost",socket = "/stornext/Home/data/allstaff/l/lu.t/mysql/var/run/mysqld/mysql.sock")
+pathwayramp <- RaMP:::getPathwayFromAnalyte( db = RaMP(),unique(paste0("hmdb:",unique(sub(".*_(HMDB\\d+)", "\\1", disassembled_lc_tissue$hmdb_Id)))), includeRaMPids = TRUE, NameOrIds = "ids", find_synonym = FALSE)
+
+
+ids = unique(paste0("hmdb:",unique(sub(".*_(HMDB\\d+)", "\\1", disassembled_lc_tissue$hmdb_Id))))
+pathwaydf <- FishersPathwayAnalysis(
+  list("metabolites" =
+         ids),
+  analyte_type = c("metabolites"),
+  pathway_all_info  = T
+)
+
+pathwaydf = cbind(pathwaydf, pathway_source = paste0(pathwaydf$pathwayName,"(",pathwaydf$pathwaySource,")"))
+
+# Pathwaydb 
+pathwaydb = lapply(tolower(unique(pathwaydf$pathway_name)), function(x){
+  submatrix= pathwaydf[which(tolower(pathwaydf$pathway_name) == x),]
+  temp = unique(unlist(str_split(submatrix$metabolite_id_list,
+                   pattern = ";")))
+  return(temp)
+})
+names(pathwaydb) = tolower(unique(pathwaydf$pathway_name))
+pathwaydb = pathwaydb[names(pathwaydb) %in% tolower(c("Metabolism",
+                                                      "Biochemical pathways: part I",
+                                                      "Disease",
+                                                      "metabolism overview",
+                                                      "Transport of small molecules")) == FALSE]
+
+#pathways = RaMP::getPathwayFromAnalyte(analytes = paste0("hmdb:",sub(".*_", "", clean_lc_tissue$variable.x)))
+
+
+candidate_pathways_GLUCOSE = c("Citric acid cycle and respiratory electron transport",
+                       "Ketone body metabolism",
+                       "Warburg effect modulated by deubiquitinating enzymes and their substrates",
+                       "Pyruvate metabolism")
+
+
+candidate_pathways_amino_acid = c("Arginine and proline metabolism",
+                                  "Alanine, aspartate and glutamate metabolism",
+                                  "Phenylalanine and tyrosine metabolism",
+                                  "Serine metabolism",
+                                  "Valine, leucine and isoleucine degradation",
+                                  "Glutamate and glutamine metabolism")
+
+neurotransmitter = c("Na+/Cl- dependent neurotransmitter transporters",
+                     "Neurotransmitter uptake and metabolism In glial cells")
+
+tumour_related = c("Energy dependent regulation of mTOR by LKB1-AMPK",
+                   "MTOR signalling", # control cell death
+                   "Neurotransmitter release cycle",
+                   "Mitochondrial tRNA aminoacylation") # control respiratory complexes
+
+of_interest = c("Neuroinflammation and glutamatergic signaling",
+                "Lactate shuttle in glial cells",
+                "Krebs cycle disorders",
+                "Glutaminolysis and Cancer",
+                "Cell recruitment (pro-inflammatory response)"
+                )
+
+library(clusterProfiler)
+gsea_results = list()
+query_final_list = list()
+topPathways= list()
+data_table = disassembled_lc_tissue
+
+  temm_hc = data.frame()
+  for(k in 1:length(unique(disassembled_lc_tissue$metabolites))){
+    temp_sub =  disassembled_lc_tissue[which(disassembled_lc_tissue$metabolites == unique(disassembled_lc_tissue$metabolites)[k]),]
+    tempsub_surgery = temp_sub[which(temp_sub$status == "Surgery"),]
+    tempsub_biopsy = temp_sub[which(temp_sub$status == "Biopsy"),]
+    
+    temp_merged = tempsub_biopsy %>% mutate(surgery_value =  tempsub_surgery$value)
+     temp_merged =  temp_merged%>% mutate(fc = log(mean( temp_merged$surgery_value)/mean( temp_merged$value)))
+    temm_hc = rbind(temm_hc,
+                    temp_merged[1,])
+  }
+  
+
+  query =   temm_hc$fc
+  names(query) = paste0("hmdb:",sub(".*_", "", (temm_hc$variable)))
+  #
+  temp_df <-  RaMP::getPathwayFromAnalyte(analytes = paste0("hmdb:",sub(".*_", "", clean_lc_tissue$variable.x)))
+  # Get final query
+  query_final = sort(query[which(names(query)%in%unique(temp_df$inputId))],
+                     decreasing = T)
+  query_final_list= query_final 
+  names(query_final) = tolower(names(query_final) )
+  gsea_results<- fgsea::fgsea(pathways = pathwaydb, 
+                             stats    = query_final,
+                             minSize  = 0,
+                             maxSize  = 1000,
+                             nperm = 3000)
+  #topPathwaysUp <- gsea_results[ES > 0][head(order(size,decreasing = T), n=10), pathway]
+  #topPathwaysDown <- gsea_results[[i]][ES < 0][head(order(size, decreasing = T), n=10), pathway]
+  #topPathways[[i]] <- c(topPathwaysUp, rev(topPathwaysDown))
+  ###   #   #  ## 
+
+################### Generate labels for specific pathway
+
+candidate_pathways_GLUCOSE = c("Glucose metabolism",
+                               "Abnormal conversion of 2-oxoglutarate to 2-hydroxyglutarate",
+                               "Citric acid cycle and respiratory electron transport",
+                       "Ketone body metabolism",
+                       "Warburg effect modulated by deubiquitinating enzymes and their substrates",
+                       "Pyruvate metabolism",
+                       "Aerobic glycolysis")
+
+candidate_pathways_amino_acid = c("Arginine and proline metabolism",
+                                  "Alanine, aspartate and glutamate metabolism",
+                                  "Phenylalanine and tyrosine metabolism",
+                                  "Serine metabolism",
+                                  "Valine, leucine and isoleucine degradation",
+                                  "Glutamate and glutamine metabolism")
+
+neurotransmitter = c("Na+/Cl- dependent neurotransmitter transporters",
+                     "Neurotransmitter uptake and metabolism In glial cells")
+
+tumour_related = c("Energy dependent regulation of mTOR by LKB1-AMPK",
+                   "MTOR signalling", # control cell death
+                   "Neurotransmitter release cycle",
+                   "Mitochondrial tRNA aminoacylation") # control respiratory complexes
+
+proposed_adb_pathway = unique(c("hmdb:HMDB0001401",#G6P
+                         pathwaydf$inputId[which(pathwaydf$pathwayName == "Pyruvate metabolism")],
+                        pathwaydf$inputId[which(pathwaydf$pathwayName == "Glycogen breakdown (glycogenolysis)")],
+                        "hmdb:HMDB0000538",
+                        "hmdb:HMDB0000058",
+                        "hmdb:HMDB0000050"))
+
+pathwaydb[[length(pathwaydb)+1]] = proposed_adb_pathway
+names(pathwaydb)[length(pathwaydb)]=tolower("Adenosine promoted energy cycle via cAMP activation")
+
+
+adnosine = "Adenosine promoted energy cycle via cAMP activation"
+#pathwaydb[["Adenosine prompted energy cycle via cAMP activation"]] = proposed_adb_pathway
+
+library(ggrepel)
+
+
+
+# colours = c("red","purple","yellow","orange","green","pink","cyan")
+# gg = ggplot()
+# ticks = data.frame()
+# for(l in 1:length(pathway)){
+#   tickSize = 0.2
+# pathway = candidate_pathways_GLUCOSE
+#  pd <- plotEnrichmentData(pathway = pathwaydb[[tolower(pathway[l])]], stats = sort(query_final,
+#                                                                                  decreasing = T), 
+#                            gseaParam =0.5)
+#   stats = query_final
+#   in_pathway = stats[which(names(stats) %in% pathwaydb[[tolower(pathway[l])]])]
+#   if(length(in_pathway) ==0){
+#     return(NULL)
+#   }
+#   in_pathway  =in_pathway[which(!duplicated(names(in_pathway)))]
+# 
+#   colour = metabolites_name = c()
+#   for(i in 1:length(names(in_pathway))){
+#     id = names(in_pathway)[i]
+#     metabolites_name = c(metabolites_name, pathwaydf$commonName[which(pathwaydf$inputId == id)][1])
+#     colour = c(colour, ifelse(in_pathway[i]>=0,"red","blue"))
+#   }
+#   
+#   pd[["ticks"]] = pd[["ticks"]] %>% mutate(name = metabolites_name) %>% mutate( colour = colour)
+#   gg = gg + with(pd,geom_line(data = curve, aes(x = rank, 
+#                                                 y = ES), color = colours[l])) 
+#   # +
+#   #        geom_hline(yintercept = pd$posES, colour = colours[l], linetype = "dashed") + geom_hline(yintercept = pd$negES, colour = colours[l], linetype = "dashed") + 
+#   #        geom_hline(yintercept = 0,  colour = "black") 
+#     
+#   ticks = rbind(ticks, pd$ticks)
+# 
+# }
+# 
+# temp_col = colours[1:length(pathway)]
+# names(temp_col) = pathway
+# 
+# 
+# 
+# ticks = ticks[!duplicated(ticks$name),]
+# gg+geom_segment(data = ticks,mapping = aes(x = rank, y = -pd$spreadES/16, xend = rank, yend = pd$spreadES/16),colour = ticks$colour, linewidth = 0.2) + 
+#          geom_text_repel(data = ticks, aes(x = rank, y =  rep(c(1, -1), length.out = nrow(ticks))*pd$spreadES/16, label = str_extract(name, "^[^,]*")),
+#                          colour = ticks$colour,
+#                          size = 3,direction = "y",  # Nudge labels slightly for better alignment
+#                          nudge_x = 0,  # No horizontal movement
+#                          force = 10,
+#                          inherit.aes = F) +
+#          labs(x = "rank", y = "enrichment score")+labs(title = pathway) + scale_colour_manual(values = temp_col) + theme(panel.background = element_blank(), panel.grid.major = element_line(color = "grey92")) 
+colnames(gsea_results)[1] = colnames(pathwaydf)[1]
+pathwaydf[,1] = tolower(pathwaydf[,1])
+pathwayofinterest = merge(pathwaydf,gsea_results, by = "pathway_name") %>% filter(p_val<=0.05) %>% filter(pval<=0.05)
+colnames(pathwayofinterest )[which(colnames(pathwayofinterest ) == "p_val")] = "Fisher_test_p"
+colnames(pathwayofinterest )[which(colnames(pathwayofinterest ) == "pval")] = "MSEA_permutation_test_p"
+
+shrinked = pathwayofinterest %>% selected()
+
+```
+
+```{r}
+colours = c("red","purple","yellow","orange","green","pink","cyan")
+gg = ggplot()
+curves = ticks = data.frame()
+speard = c()
+pathway = of_interest
+pathway = "adora2b mediated anti-inflammatory cytokines production"
+names(query_final) = tolower(names(query_final))
+for (l in 1:length(pathway)) {
+  tickSize = rel(0.2)
+  pd <-
+    fgsea::plotEnrichmentData(
+      pathway = pathwaydb[[tolower(pathway[l])]],
+      stats = sort(query_final,
+                   decreasing = T),
+      gseaParam = 0.5
+    )
+  speard =  pd$spreadES
+  stats = query_final
+  in_pathway = stats[which(names(stats) %in% pathwaydb[[tolower(pathway[l])]])]
+  if (length(in_pathway) == 0) {
+    next
+  }
+  in_pathway  = in_pathway[which(!duplicated(names(in_pathway)))]
+  
+  colour = metabolites_name = c()
+  for (i in 1:length(names(in_pathway))) {
+    id = names(in_pathway)[i]
+    metabolites_name = c(metabolites_name,
+                         unique(disassembled_lc_tissue$metabolites[which(tolower(paste0("hmdb:",disassembled_lc_tissue$hmdb_Id))==id)]))
+    colour = c(colour, ifelse(in_pathway[i] >= 0, "darkred", "darkblue"))
+  }
+  
+  pd[["ticks"]] = pd[["ticks"]] %>% mutate(name = metabolites_name) %>% mutate(colour = colour)
+  curves = pd$curve %>% mutate(colour = pathway[l])
+  # +
+  #        geom_hline(yintercept = pd$posES, colour = colours[l], linetype = "dashed") + geom_hline(yintercept = pd$negES, colour = colours[l], linetype = "dashed") +
+  #        geom_hline(yintercept = 0,  colour = "black")
+  
+  ticks = pd$ticks
+  ticks = ticks[!duplicated(ticks$name), ]
+gg= with(curves, ggplot() +geom_ribbon(
+        data = pd$stats,
+        mapping = aes(
+          x = rank,
+          ymin = 0,
+          ymax = stat / pd$maxAbsStat * (pd$spreadES /
+                                        4)
+        ),
+        fill = "grey"
+      )+geom_line(aes(
+  x = rank,
+  y = ES,
+  color = as.character(ES > 0),
+  group = 1
+)) +
+  scale_color_manual(values = c("FALSE" =  "blue", "TRUE" = "red"),
+                     ,guide = "none") + geom_segment(
+                       data = ticks,
+                       mapping = aes(
+                         x = rank,
+                         y = -max(speard) / 16,
+                         xend = rank,
+                         yend = max(speard) / 16
+                       ),
+                       colour = ticks$colour,
+                       linewidth = 0.4
+                     ) +
+  geom_text_repel(
+    data = ticks,
+    aes(
+      x = rank,
+      y =  rep(c(1, -1), length.out = nrow(ticks)) * max(speard) / 16,
+      label = str_extract(name, "^[^,]*")
+    ),
+    colour = ticks$colour,
+    size = 3,
+    direction = "y",
+    # Nudge labels slightly for better alignment
+    nudge_x = 0,
+    # No horizontal movement
+    force = 20,
+    inherit.aes = F,
+    min.segment.length = 0
+  ) +
+  labs(x = "rank", y = "enrichment score") + labs(title = pathway[l]) + theme(panel.background = element_blank(),
+                                                                           panel.grid.major = element_line(color = "grey92")))
+gg+ theme(        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_blank())
+ggsave(paste0("~/anheart/msea/",pathway[l],".svg"))
+# svglite::svglite(paste0("~/anheart/msea/",pathway[l],".svg"))
+# gg+ theme(        panel.background = element_blank(),
+#         panel.grid.major = element_blank(),
+#         panel.grid = element_blank(),
+#         panel.border = element_blank(),
+#         axis.line = element_blank())
+# dev.off()
+}
+
+# temp_col = colours[1:length(pathway)]
+# names(temp_col) = pathway
+# 
+# ticks = ticks[!duplicated(ticks$name), ]
+# ggplot() + geom_line(aes(
+#   x = rank,
+#   y = ES,
+#   color = as.character(ES > 0),
+#   ,
+#   group = 1
+# )) +
+#   scale_color_manual(values = c("FALSE" =  "blue", "TRUE" = "red"),
+#                      ,
+#                      guide = "none") + geom_segment(
+#                        data = ticks,
+#                        mapping = aes(
+#                          x = rank,
+#                          y = -max(speard) / 16,
+#                          xend = rank,
+#                          yend = max(speard) / 16
+#                        ),
+#                        colour = ticks$colour,
+#                        linewidth = 0.4
+#                      ) +
+#   geom_text_repel(
+#     data = ticks,
+#     aes(
+#       x = rank,
+#       y =  rep(c(1, -1), length.out = nrow(ticks)) * max(speard) / 16,
+#       label = str_extract(name, "^[^,]*")
+#     ),
+#     colour = ticks$colour,
+#     size = 3,
+#     direction = "y",
+#     # Nudge labels slightly for better alignment
+#     nudge_x = 0,
+#     # No horizontal movement
+#     force = 20,
+#     inherit.aes = F,
+#     min.segment.length = 0
+#   ) +
+#   labs(x = "rank", y = "enrichment score") + labs(title = pathway) + theme(panel.background = element_blank(),
+#                                                                            panel.grid.major = element_line(color = "grey92")) #+ scale_colour_manual(values = temp_col) 
+
+
+```
+
+```{r customshapes}
+mystar <- function(coords, v=NULL, params) {
+  vertex.color <- params("vertex", "color")
+  if (length(vertex.color) != 1 && !is.null(v)) {
+    vertex.color <- vertex.color[v]
+  }
+  vertex.size  <- 1/200 * params("vertex", "size")
+  if (length(vertex.size) != 1 && !is.null(v)) {
+    vertex.size <- vertex.size[v]
+  }
+  norays <- params("vertex", "norays")
+  if (length(norays) != 1 && !is.null(v)) {
+    norays <- norays[v]
+  }
+
+  mapply(coords[,1], coords[,2], vertex.color, vertex.size, norays,
+         FUN=function(x, y, bg, size, nor) {
+           symbols(x=x, y=y, bg=bg,
+                   stars=matrix(c(size,size/2), nrow=1, ncol=nor*2),
+                   add=TRUE, inches=FALSE)
+         })
+}
+# no clipping, edges will be below the vertices anyway
+add_shape("star", clip=shape_noclip,
+                 plot=mystar, parameters=list(vertex.norays=5))
+plot(graph, vertex.shape="sphere")
+```
+
+
+
+```{r adenosine_paper}
+library(igraph)
+proposed_adb_pathway = unique(c("hmdb:HMDB0001401",#G6P
+                        "hmdb:HMDB0000538",
+                        "hmdb:HMDB0000058",#cAMP
+                        "hmdb:HMDB0000050"))
+
+
+network_df = data.frame(
+  src = c("adenylyl cyclase","cAMP","PKA","Glycogenoglysis","PKA","Glucose.6-phosphate","Glucose","Glycolysis","Pyruvate","Lactate","Extraceullar Adenosine","Glutamate","Adenosine.triphosphate","Adenosine.triphosphate","Extraceullar Adenosine","Extracellular Lactate","A2BR"),
+  dest = c("cAMP","PKA","Glycogenoglysis","Glucose.6-phosphate","Glycolysis","Glycolysis","Glycolysis","Pyruvate","Lactate","Pyruvate","A2BR","Glycolysis","A2BR","Extracellular Lactate","Extracellular Lactate","A2BR","adenylyl cyclase"),
+  src_type = c("Protein","metabolites","Protein","Process","Protein","metabolites","metabolites","Process","metabolites","metabolites","metabolites","metabolites","metabolites",
+               "metabolites","metabolites","metabolites","Receptor"),
+  dest_type = c("metabolites", "Protein","Process","metabolites","Process","Process","Process","metabolites","metabolites","metabolites","Receptor","Process","Receptor","metabolites","metabolites",
+                "Receptor","Protein"),
+  src_id = c(NA,"hmdb:HMDB0000058",NA,NA,NA,"hmdb:HMDB0001401","hmdb:HMDB0000122",NA,"hmdb:HMDB0000243","hmdb:HMDB0001311","hmdb:HMDB0000050","hmdb:HMDB0000148","hmdb:HMDB0000538","hmdb:HMDB0000538", "hmdb:HMDB0000050", "hmdb:HMDB0001311",NA),
+  dest_id = c("hmdb:HMDB0000058",NA,NA,"hmdb:HMDB0001401",NA,NA,NA,"hmdb:HMDB0000243","hmdb:HMDB0001311","hmdb:HMDB0000243",NA,NA,NA,"hmdb:HMDB0001311","hmdb:HMDB0001311",NA,NA)
+)
+graph = graph_from_data_frame(cbind(network_df$src, network_df$dest),
+                               directed = TRUE)
+v_names = names(V(graph))
+structuredf = data.frame(analyte = c(network_df$src,network_df$dest),
+                    type = c(network_df$src_type,network_df$dest_type),
+                    id = c(network_df$src_id,network_df$dest_id)) %>% filter(!duplicated(analyte))
+size = colour = shape = c()
+for(i in 1:length(v_names)){
+  colour_type = structuredf$type[which(structuredf$analyte == v_names[i])]
+  if(colour_type == "Protein"){
+    shape[i] = "square"
+    size[i] = 10
+    colour[i] = "green"
+  }else if(colour_type == "metabolites"){
+    shape[i] = "sphere"
+    size[i] = 15
+    colour[i] = "red"
+  }else if(colour_type == "Process"){
+    shape[i] = "rectangle"
+    size[i] = 30
+    colour[i] = "yellow"
+  }else if(colour_type == "Receptor"){
+    shape[i] = "pie"
+    size[i] = 15
+    colour[i] = "gray"
+  }
+}
+V(graph)$shape = shape
+
+svglite::svglite("~/anheart/adenosine_network.svg",
+                 width = 10,height =10)
+plot(graph,
+     vertex.size = size,
+     vertex.color = colour,
+     layout = layout_with_fr(graph),
+    arrow.size= 3)
+legend("topleft", legend = c("Metabolites", "Protein",
+                             "Metabolism","Receptor"), col = c("red", "green",
+                                                            "yellow","gray"), pch = 16)
+
+dev.off()
+
+```
+
+
+
+```{r getnewtwork}
+reaction_levels = c("Control(indirect)",
+                  "Process",
+                  "Process(indirect)",
+                  "Binding",
+                  "Control(In)",
+                  "Control(Out)")
+ele_path = c(of_interest,"Citric Acid Cycle")
+non_duplicated_source =  source_df[which(!duplicated(source_df$rampId)),]
+for(i in 1:length(ele_path )) {
+  type = pathwaydf$type[which(tolower(pathwaydf$pathway_name) == tolower(ele_path [i]))][1]
+  if (type == "wiki") {
+  index = which(tolower(names(humanwiki_ramp)) == tolower(ele_path [i]))
+  if (length(index) == 0) {
+      next
+  }
+  db = humanwiki_ramp
+  }else if (type == "reactome") {
+    index = which(tolower(names(humanReactome_ramp)) == tolower(ele_path [i]))
+  if (length(index) == 0) {
+      next
+  }
+  db = humanReactome_ramp
+} else if (type == "kegg") {
+      index = which(tolower(names(humankegg_ramp)) == tolower(ele_path [i]))
+  if (length(index) == 0) {
+      next
+  }
+  db = humankegg_ramp
+} else if (type == "hmdb") {
+        index = which(tolower(names(humansmp_ramp)) == tolower(ele_path [i]))
+  if (length(index) == 0) {
+      next
+  }
+  db = humansmp_ramp
+} else{
+  next
+}
+
+    pathway_ramp = db[index]
+    in_pathway = pathwaydb[[tolower(ele_path [i])]]
+    sub_source_df = source_df[which(tolower(source_df$sourceId) %in% pathwaydb[[tolower(ele_path [i])]]),] %>% filter(!duplicated(sourceId))
+    
+    mixed_merged = with(
+      non_duplicated_source,
+      pathway_ramp[[1]][[9]] %>% filter(
+        src %in% sub_source_df$rampId |
+          dest %in% sub_source_df$rampId
+      ) %>% na.omit() %>% rowwise() %>%
+        mutate(src_name = commonName[which(rampId == src)]) %>%
+        mutate(dest_name = commonName[which(rampId == dest)])
+    ) %>%
+      mutate(src_type = ifelse(grepl(src, pattern = "RAMP_G"), "Gene", "Metabolites")) %>%
+      mutate(dest_type = ifelse(grepl(dest, pattern = "RAMP_G"), "Gene", "Metabolites")) %>%
+      mutate(reaction = reaction_levels[reaction_type])
+    g <- graph_from_data_frame(cbind(mixed_merged$src_name, mixed_merged$dest_name),
+                               directed = TRUE)
+    # Example vectors for customization
+    extended_df = rbind(
+      data.frame(
+        analyte = mixed_merged$src,
+        type = mixed_merged$src_type,
+        name = mixed_merged$src_name
+      ),
+      data.frame(
+        analyte = mixed_merged$dest,
+        type = mixed_merged$dest_type,
+        name = mixed_merged$dest_name
+      )
+    ) %>% filter(!duplicated(name))
+    extended_df  = extended_df[which(extended_df$name %in% names(V(g))), ] %>% rowwise() %>% mutate(primary_size =
+                                                                                                      sqrt(length(which(
+                                                                                                        c(unlist(mixed_merged[, 1]), unlist(mixed_merged[, 2])) == analyte
+                                                                                                      )))) %>%
+      mutate(colour = ifelse(type == "Gene", "gray", "coral")) %>%
+      mutate(shape = ifelse(type == "Gene", "rectangle", "cycle"))
+    ################ Specialised for LC data ################  ################  ################
+    View(summary_data)
+    summary_data_sub = summary_data
+    sub_sum_source = source_df %>% filter(sourceId %in% summary_data$sourceId) %>% filter(!duplicated(sourceId))
+    summary_data_sub = merge(summary_data_sub, sub_sum_source, by = "sourceId")
+    ################ Specialised for LC data ################  ################  ################
+    colour = c()
+    for (k in 1:nrow(extended_df)) {
+      if (extended_df$colour[k] == "coral") {
+        level = summary_data_sub[which(summary_data_sub$rampId == extended_df$analyte[k]), ]
+        if((nrow(level)==0)){
+                  colour = c(colour, "gray")
+        }else if (level$mean >= 0) {
+          colour = c(colour, "coral2")
+        } else{
+          colour = c(colour, "cyan2")
+        }
+      } else{
+        colour = c(colour, "gray")
+      }
+    }
+    extended_df$colour = colour
+    
+    
+    # Plot with customized vertex attributes
+    svglite::svglite(paste0(ele_path [i], "_test_igraph_graphopt_mixed.svg"),
+                     width = 15,
+                     height = 15)
+    plot(
+      g,
+      vertex.size = rel(sqrt(extended_df$primary_size * 30)),
+      # Apply custom vertex sizes
+      vertex.color = extended_df$colour,
+      # Apply custom vertex colors
+      vertex.label = V(g)$name,
+      # Display vertex names
+      vertex.label.cex = rel(0.5),
+      # Apply custom label sizes
+      #vertex.label.color = label_colors,  # Apply custom label colors
+      edge.arrow.size = 0.8,
+      main = ele_path [i],
+      layout = layout_with_graphopt(g)
+    )
+    legend(
+      'topleft',
+      legend = c(
+        "Upregulated metabolites after teatment",
+        "Downregulated metabolites after teatment",
+        "genes"
+      ),
+      col = c("coral2", "cyan2", "gray"),
+      pch = 21,
+      cex = 0.8
+    )
+    dev.off()
+    
+    # library(ggraph)
+    # library(ggplot2)
+    # library(igraph)
+    # library(shape)
+    # custom_edge_geom <- function() {
+    #   geom_segment(aes(xend = xend, yend = yend),
+    #                arrow = arrow(type = "closed", length = unit(0.3, "inches")),
+    #                lineend = "round")
+}
+```
+
+
+
+
+```{r getnewtwork}
+reaction_levels = c("Control(indirect)",
+                  "Process",
+                  "Process(indirect)",
+                  "Binding",
+                  "Control(In)",
+                  "Control(Out)")
+ele_path = c(of_interest,"Citric Acid Cycle")
+non_duplicated_source =  source_df[which(!duplicated(source_df$rampId)),]
+for(i in 1:length(ele_path )) {
+  type = pathwaydf$type[which(tolower(pathwaydf$pathway_name) == tolower(ele_path [i]))][1]
+  if (type == "wiki") {
+  index = which(tolower(names(humanwiki_ramp)) == tolower(ele_path [i]))
+  if (length(index) == 0) {
+      next
+  }
+  db = humanwiki_ramp
+  }else if (type == "reactome") {
+    index = which(tolower(names(humanReactome_ramp)) == tolower(ele_path [i]))
+  if (length(index) == 0) {
+      next
+  }
+  db = humanReactome_ramp
+} else if (type == "kegg") {
+      index = which(tolower(names(humankegg_ramp)) == tolower(ele_path [i]))
+  if (length(index) == 0) {
+      next
+  }
+  db = humankegg_ramp
+} else if (type == "hmdb") {
+        index = which(tolower(names(humansmp_ramp)) == tolower(ele_path [i]))
+  if (length(index) == 0) {
+      next
+  }
+  db = humansmp_ramp
+} else{
+  next
+}
+
+    pathway_ramp = db[index]
+    in_pathway = pathwaydb[[tolower(ele_path [i])]]
+    sub_source_df = source_df[which(tolower(source_df$sourceId) %in% pathwaydb[[tolower(ele_path [i])]]),] %>% filter(!duplicated(sourceId))
+    
+    mixed_merged = with(
+      non_duplicated_source,
+      pathway_ramp[[1]][[9]] %>% filter(
+        src %in% sub_source_df$rampId |
+          dest %in% sub_source_df$rampId
+      ) %>% na.omit() %>% rowwise() %>%
+        mutate(src_name = commonName[which(rampId == src)]) %>%
+        mutate(dest_name = commonName[which(rampId == dest)])
+    ) %>%
+      mutate(src_type = ifelse(grepl(src, pattern = "RAMP_G"), "Gene", "Metabolites")) %>%
+      mutate(dest_type = ifelse(grepl(dest, pattern = "RAMP_G"), "Gene", "Metabolites")) %>%
+      mutate(reaction = reaction_levels[reaction_type])
+    g <- graph_from_data_frame(cbind(mixed_merged$src_name, mixed_merged$dest_name),
+                               directed = TRUE)
+    # Example vectors for customization
+    extended_df = rbind(
+      data.frame(
+        analyte = mixed_merged$src,
+        type = mixed_merged$src_type,
+        name = mixed_merged$src_name
+      ),
+      data.frame(
+        analyte = mixed_merged$dest,
+        type = mixed_merged$dest_type,
+        name = mixed_merged$dest_name
+      )
+    ) %>% filter(!duplicated(name))
+    extended_df  = extended_df[which(extended_df$name %in% names(V(g))), ] %>% rowwise() %>% mutate(primary_size =
+                                                                                                      sqrt(length(which(
+                                                                                                        c(unlist(mixed_merged[, 1]), unlist(mixed_merged[, 2])) == analyte
+                                                                                                      )))) %>%
+      mutate(colour = ifelse(type == "Gene", "gray", "coral")) %>%
+      mutate(shape = ifelse(type == "Gene", "rectangle", "cycle"))
+    ################ Specialised for LC data ################  ################  ################
+    View(summary_data)
+    summary_data_sub = summary_data
+    sub_sum_source = source_df %>% filter(sourceId %in% summary_data$sourceId) %>% filter(!duplicated(sourceId))
+    summary_data_sub = merge(summary_data_sub, sub_sum_source, by = "sourceId")
+    ################ Specialised for LC data ################  ################  ################
+    colour = c()
+    for (k in 1:nrow(extended_df)) {
+      if (extended_df$colour[k] == "coral") {
+        level = summary_data_sub[which(summary_data_sub$rampId == extended_df$analyte[k]), ]
+        if((nrow(level)==0)){
+                  colour = c(colour, "gray")
+        }else if (level$mean >= 0) {
+          colour = c(colour, "coral2")
+        } else{
+          colour = c(colour, "cyan2")
+        }
+      } else{
+        colour = c(colour, "gray")
+      }
+    }
+    extended_df$colour = colour
+    
+    
+    # Plot with customized vertex attributes
+    svglite::svglite(paste0(ele_path [i], "_test_igraph_graphopt_mixed.svg"),
+                     width = 15,
+                     height = 15)
+    plot(
+      g,
+      vertex.size = rel(sqrt(extended_df$primary_size * 30)),
+      # Apply custom vertex sizes
+      vertex.color = extended_df$colour,
+      # Apply custom vertex colors
+      vertex.label = V(g)$name,
+      # Display vertex names
+      vertex.label.cex = rel(0.5),
+      # Apply custom label sizes
+      #vertex.label.color = label_colors,  # Apply custom label colors
+      edge.arrow.size = 0.8,
+      main = ele_path [i],
+      layout = layout_with_graphopt(g)
+    )
+    legend(
+      'topleft',
+      legend = c(
+        "Upregulated metabolites after teatment",
+        "Downregulated metabolites after teatment",
+        "genes"
+      ),
+      col = c("coral2", "cyan2", "gray"),
+      pch = 21,
+      cex = 0.8
+    )
+    dev.off()
+    
+    # library(ggraph)
+    # library(ggplot2)
+    # library(igraph)
+    # library(shape)
+    # custom_edge_geom <- function() {
+    #   geom_segment(aes(xend = xend, yend = yend),
+    #                arrow = arrow(type = "closed", length = unit(0.3, "inches")),
+    #                lineend = "round")
+}
+```
