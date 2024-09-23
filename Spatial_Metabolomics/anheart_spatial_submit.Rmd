@@ -1,0 +1,502 @@
+```{r loading}
+library(plyr)
+library(reshape2)
+library(dplyr)
+library(ggplot2)
+library(ggdendro)
+library(gridExtra)
+library(dendextend)
+library(RaMP)
+library(dplyr)
+library(stringr)
+library(gridExtra)
+library(ggnewscale)
+library(gridBase)
+library(grid)
+```
+
+```{r colours}
+colour_m = data.frame(cbind(
+  colors = c(
+    "#00FFFF",
+    "#FF2400",
+    "#6A5ACD",
+    "#008080",
+    "#FFD700",
+    "#228B22",
+    "#4B0082",
+    "#90EE90",
+    "#FF7F50",
+    "#8F00FF"
+  ),
+  patient_num = c(
+    "001",
+    "003",
+    "004",
+    "005",
+    "006",
+    "007",
+    "008",
+    "009",
+    "011",
+    "012"
+  ),
+  patient_index = c(
+    "A-01",
+    "O-01",
+    "A-02",
+    "A-03",
+    "O-02",
+    "A-04",
+    "A-05",
+    "A-06",
+    "O-05",
+    "A-07"
+  )
+))
+
+colors_pat = c(
+  "#00FFFF",
+  "#FF2400",
+  "#6A5ACD",
+  "#008080",
+  "#FFD700",
+  "#228B22",
+  "#4B0082",
+  "#90EE90",
+  "#FF7F50",
+  "#8F00FF"
+)
+names(colors_pat) = c("001",
+                      "003",
+                      "004",
+                      "005",
+                      "006",
+                      "007",
+                      "008",
+                      "009",
+                      "011",
+                      "012")
+names(colors_pat) = c("A-01",
+                      "O-01",
+                      "A-02",
+                      "A-03",
+                      "O-02",
+                      "A-04",
+                      "A-05",
+                      "A-06",
+                      "O-05",
+                      "A-07")
+colour_new = rbind(
+  colour_m %>% mutate(patient_num = paste0(patient_num, "Biopsy")) %>% arrange(patient_index),
+  colour_m %>% mutate(patient_num = paste0(patient_num, "Surgery")) %>% arrange(patient_index)
+)
+colour_new = colour_new %>% mutate(num = str_extract(patient_num, pattern = "[0-9][0-9][0-9]")) %>% mutate(type = sub("[0-9][0-9][0-9]", "", patient_num)) %>% group_by(patient_index) %>% arrange((type))
+```
+
+
+
+
+```{r helperfunctions}
+convert_xlsx_to_plotdf = function(xlsx_data){
+  raw_df = reshape2::melt(xlsx_data) %>% mutate(patientnum = str_extract(compound, pattern = "00[1-9]")) %>%
+    mutate(status = ifelse(grepl(compound, pattern = "Bx"),
+                           "Biopsy","Surgery")) %>%
+    mutate(metabolites = sub("_HMDB.*$", "", variable))
+  
+  plot_df = data.frame()
+  for(i in 1: length(unique(raw_df$metabolites))){
+    metabolite = unique(raw_df$metabolites)[i]
+    sub_df = raw_df[which(raw_df$metabolites == metabolite ),]
+    sub_df_biopsy = sub_df[which(
+      sub_df$status =="Biopsy" ),]
+    sub_df_srugery= sub_df[which(
+      sub_df$status =="Surgery" ),]
+    merged_surgery_biopsy = merge( sub_df_biopsy,
+                                   sub_df_srugery,
+                                   by = "patientnum")
+    if(any(is.na(c(merged_surgery_biopsy$value.x,
+                   merged_surgery_biopsy$value.y)))){
+      next
+    }
+    plot_df = rbind(plot_df,
+                    merged_surgery_biopsy)
+  }
+  return(plot_df)
+}
+filter_against_non_significant_metabolures = function(unfiltered_table,
+                                                      all_info = F){
+  unique_met = unique(unfiltered_table$metabolites.x)
+  return_table = data.frame()
+  for(i in 1:length(unique_met)){
+    sub_table = unfiltered_table[which(unfiltered_table$metabolites.x == unique_met[i]),]
+    test = t.test(as.numeric(sub_table$value.x),as.numeric(sub_table$value.y),
+                  paired = TRUE,
+                  alternative = "two.sided",
+                  na.action = na.omit)
+    
+    if(test$p.value<=0.05){
+      return_sub = sub_table %>% mutate(p_val = test$p.value) %>%
+        mutate(expected_diff = test$estimate)
+      return_table = rbind(return_table,
+                           return_sub)
+    }else if(all_info ==T){
+      return_sub = sub_table %>% mutate(p_val = test$p.value) %>%
+        mutate(expected_diff = test$estimate)
+      return_table = rbind(return_table,
+                           return_sub)
+    }else{
+      next
+    }
+  }
+  return(return_table)
+}
+disassemble_data = function(combined_data){
+  replicated_colname = gsub("\\.[xy]$", "",colnames(combined_data))
+  index_replicated = which(duplicated(replicated_colname))
+  name_non_replicated = unique(replicated_colname)[which(!unique(replicated_colname) %in% replicated_colname[index_replicated])]
+  index_non_replicated = c(1:ncol(combined_data))[-c(which(replicated_colname %in% name_non_replicated),
+                                                     index_replicated)]
+  
+  
+  patient_surgery = cbind(combined_data[,which(replicated_colname %in% name_non_replicated)],
+                          combined_data[,index_replicated])
+  colnames(patient_surgery) = gsub("\\.[xy]$", "",colnames(patient_surgery))
+  #
+  patient_biopsy = cbind(combined_data[,which(replicated_colname %in% name_non_replicated)],
+                          combined_data[,index_non_replicated])
+  colnames(patient_biopsy) = gsub("\\.[xy]$", "",colnames(  patient_biopsy))
+  
+  return_df = rbind(patient_surgery,
+                    patient_biopsy)
+return(return_df)
+}
+
+
+gaussian_blur <- function( matrix, sigma = 1,
+                          kernel_size = 3,
+                          return_vector = F) {
+  # Create a kernel for Gaussian blur
+  if((kernel_size %% 2) == 0){
+    stop("Please use odd kernel size, even number can leads to asymmetric blurring")
+  }
+  size <- floor(kernel_size/2)
+  kernel <- outer(
+    seq(-size, size),
+    seq(-size, size),
+    function(x, y) {
+      exp(-(x^2 + y^2) / (2 * as.numeric(sigma)^2)) / (2 * pi * as.numeric(sigma)^2)
+    }
+  )
+  
+  # Normalize the kernel
+  kernel <- kernel / sum(kernel)
+  
+  # Apply convolution with the kernel
+  blurred_matrix <- matrix(0, nrow = nrow(matrix), ncol = ncol(matrix))
+  
+ ########################################## top left ##########################################
+  for (i in 1:size) {
+    # Define the boundaries for convolution
+    row_index = (i-size):(i+size)
+      row_index[which(row_index<=0)]= abs(row_index[which(row_index<=0)]-1-i)
+    for (j in 1:size) {
+      col_index = (j-size):(j+size)
+      col_index[which(col_index<=0)]= abs(col_index[which(col_index<=0)]-1-j) 
+      # Get the unprocessed kernel
+      # Convolution operation within boundaries
+      blurred_matrix[i, j] <- sum(matrix[row_index,
+                                         col_index]* kernel)
+    }
+  }
+  
+  ########################################## top right ##########################################
+  for (i in (nrow(matrix)-size+1):(nrow(matrix))) {
+    # Define the boundaries for convolution
+    row_index = (i-size):(i+size)
+    row_index[which(row_index>nrow(matrix))]= 2*nrow(matrix) - row_index[which(row_index>nrow(matrix))] 
+    for (j in 1:size) {
+      col_index = (j-size):(j+size)
+      col_index[which(col_index<=0)]= abs(col_index[which(col_index<=0)]-1-j) 
+      # Get the unprocessed kernel
+      # Convolution operation within boundaries
+      blurred_matrix[i, j] <- sum(matrix[row_index,
+                                         col_index]* kernel)
+    }
+  }
+  
+  
+  ########################################## bottom right ##########################################
+  for (i in (nrow(matrix)-size+1):(nrow(matrix))) {
+    # Define the boundaries for convolution
+    row_index = (i-size):(i+size)
+    row_index[which(row_index>nrow(matrix))]= 2*nrow(matrix) - row_index[which(row_index>nrow(matrix))] 
+    for (j in (ncol(matrix)-size+1):ncol(matrix)) {
+      col_index = (j-size):(j+size)
+      col_index[which(col_index>ncol(matrix))]= 2*ncol(matrix) - col_index[which(col_index>ncol(matrix))] 
+      # Get the unprocessed kernel
+      # Convolution operation within boundaries
+      blurred_matrix[i, j] <- sum(matrix[row_index,
+                                         col_index]* kernel)
+    }
+  }
+  
+  ########################################## bottom left ##########################################
+  for (i in 1:size) {
+    # Define the boundaries for convolution
+    row_index = (i-size):(i+size)
+    row_index[which(row_index<=0)]= abs(row_index[which(row_index<=0)]-1-i)
+    for (j in (ncol(matrix)-size+1):ncol(matrix)) {
+      col_index = (j-size):(j+size)
+      col_index[which(col_index>ncol(matrix))]= 2*ncol(matrix) - col_index[which(col_index>ncol(matrix))] 
+      # Get the unprocessed kernel
+      # Convolution operation within boundaries
+      blurred_matrix[i, j] <- sum(matrix[row_index,
+                                         col_index]* kernel)
+    }
+  }
+  
+  
+  
+  for (i in (size+1):(nrow(matrix)-size)) {
+    # Define the boundaries for convolution
+    row_index = (i-size):(i+size)
+    # if(i<=size){
+    #   row_index[which(row_index<=0)]= abs(row_index[which(row_index<=0)]-1-i)
+    # }
+    # if(i>(nrow(matrix)-size)){
+    #   row_index[which(row_index>nrow(matrix))]= 2*nrow(matrix) - row_index[which(row_index>nrow(matrix))] 
+    # }
+    for (j in (size+1):(ncol(matrix)-size)) {
+      col_index = (j-size):(j+size)
+      # if(j<=size){
+      #   col_index[which(col_index<=0)]= abs(col_index[which(col_index<=0)]-1-j) 
+      # }
+      # if(j>(ncol(matrix)-size)){
+      #   col_index[which(col_index>ncol(matrix))]= 2*ncol(matrix) - col_index[which(col_index>ncol(matrix))] 
+      # }
+      # Get the unprocessed kernel
+      # Convolution operation within boundaries
+      
+      blurred_matrix[i, j] <- sum(matrix[row_index,
+                                         col_index]* kernel)
+    }
+  }
+  if(return_vector == F){
+    return(blurred_matrix) 
+  }else{
+    return(as.vector(blurred_matrix))
+  }
+}
+```
+
+
+
+```{r 3dplotly_adenosine}
+col = colorRampPalette(c("red","orange","blue","white"),,bias = 1)
+byrow = T
+BLUR_INDEX = 3
+biopsy = readRDS("Spatial_Metabolomics/SM_biopsy_pat3.rds")
+surgery= readRDS("Spatial_Metabolomics/SM_surgery_pat3.rds")
+dim = read.csv("Spatial_Metabolomics/Dimension_width_height.csv")
+
+
+byrow = F
+BLUR_INDEX = 3
+mzs = c(268.1040,
+        209.1025,
+        147.0764)
+mets = c("adenosine","2HG","glutamine")
+# rescale is a function to rescale the matrix to a new dimension
+rescale <- function(x, newrange=range(x)){
+  xrange <- range(x)
+  mfac <- (newrange[2]-newrange[1])/(xrange[2]-xrange[1])
+  newrange[1]+(x-xrange[1])*mfac
+}
+
+# ResizeMat is a function that uses interpolation to merge pixel information
+ResizeMat <- function(mat, ndim=dim(mat)){
+  if(!require(fields)) stop("`fields` required.")
+  
+  # input object
+  odim <- dim(mat)
+  obj <- list(x= 1:odim[1], y=1:odim[2], z= mat)
+  
+  # output object
+  ans <- matrix(NA, nrow=ndim[1], ncol=ndim[2])
+  ndim <- dim(ans)
+  
+  # rescaling
+  ncord <- as.matrix(expand.grid(seq_len(ndim[1]), seq_len(ndim[2])))
+  loc <- ncord
+  loc[,1] = rescale(ncord[,1], c(1,odim[1]))
+  loc[,2] = rescale(ncord[,2], c(1,odim[2]))
+  
+  # interpolation
+  ans[ncord] <- interp.surface(obj, loc)
+  ans
+}
+
+
+for(u in 1:3){
+mz = mzs[u]
+met = mets[u]
+surgery_mzs = sub("X","", colnames(surgery))
+index_sur = which.min(abs(as.numeric(surgery_mzs)-mz))
+surgery_mzs[index_sur]
+imaging_matrix_surgery = surgery[,index_sur]
+# # # 
+biopsy_mzs = sub("X","", colnames(biopsy))
+index_bio = which.min(abs(as.numeric(biopsy_mzs)- mz))
+biopsy_mzs[index_bio]
+imaging_matrix_biopsy = biopsy[,index_bio]
+
+image(matrix(imaging_matrix_surgery, nrow = sub_dim$height[2], byrow =T))
+image( gaussian_blur(matrix(
+       log(imaging_matrix_surgery+1),
+       ncol = sub_dim$width[2], byrow = T
+     )))
+image( gaussian_blur(matrix(
+       log(imaging_matrix_biopsy+1),
+       ncol = sub_dim$width[1], byrow = byrow
+     )))
+
+par(mfrow = c(1,2))
+print(fields::image.plot(
+gaussian_blur(matrix(
+       log(imaging_matrix_biopsy+1),
+       ncol = sub_dim$width[1], byrow = byrow
+     )),
+     main = paste0("pre",mets[u]),
+     zlim = c(0, max(c(
+       log(imaging_matrix_biopsy +1), log(imaging_matrix_biopsy+1)
+     ))*0.4),
+     useRaster = T,
+     axes = FALSE,
+     xlab = "",
+     ylab = "",
+    cex.main = 1.5,
+    legend.cex = 2,
+    breaks = seq(0, 2,length.out = 31),col=rev(col(30))))
+print(fields::image.plot(
+gaussian_blur(matrix(
+       log(imaging_matrix_surgery+1),
+       ncol = sub_dim$width[2], byrow = T
+     )),
+     main = paste0("post",mets[u]),
+     zlim = c(0, max(c(
+       log(imaging_matrix_biopsy +1), log(imaging_matrix_surgery+1)
+     ))*0.4),
+     useRaster = T,
+     axes = FALSE,
+     xlab = "",
+     ylab = "",
+    cex.main = 1.5,
+    legend.cex = 2,
+    breaks = seq(0, 2,length.out = 31),col=rev(col(30))))
+mplified_2HG_surgery = gaussian_blur(matrix(
+       log(imaging_matrix_surgery+1),
+       ncol = sub_dim$width[2], byrow = T
+     ))
+mean(amplified_2HG_surgery)
+if(BLUR_INDEX == 1){
+ amplified_2HG_biopsy = matrix(
+       log(imaging_matrix_biopsy+1),
+       ncol = sub_dim$width[1], byrow = byrow
+       # remove edges
+     )
+ amplified_2HG_biopsy = ResizeMat(amplified_2HG_biopsy,
+                                  ndim =c(nrow(amplified_2HG_biopsy)*3,
+                                          ncol(amplified_2HG_biopsy)*3))
+ amplified_2HG_biopsy[amplified_2HG_biopsy<=  quantile(amplified_2HG_biopsy,0.4,
+                                                       na.rm = T)] = 0
+}else{
+   amplified_2HG_biopsy = gaussian_blur(gaussian_blur(matrix(
+       log(imaging_matrix_biopsy+1),
+       ncol = sub_dim$width[1], byrow = byrow
+     ))) 
+}
+#mean(as.numeric(amplified_2HG_biopsy))
+
+
+melted_biopsy = reshape2::melt(t(amplified_2HG_biopsy)) %>% filter(value !=0)
+melted_surgery = reshape2::melt(t(amplified_2HG_surgery)) %>% filter(value !=0)
+library(plotly)
+kd_biopsy <- with(melted_biopsy , MASS::kde2d(Var1, Var2, n = 150))
+kd_biopsy$z = kd_biopsy$z*(sum(amplified_2HG_biopsy, na.rm = T)/(sum(amplified_2HG_biopsy, na.rm = T)+sum(amplified_2HG_surgery)))
+fig_biopsy <- plot_ly(x = kd_biopsy$x, y = kd_biopsy$y, z = kd_biopsy$z) %>% add_surface()
+
+kd_surgery <- with(melted_surgery , MASS::kde2d(Var1, Var2, n = 150))
+kd_surgery$z = kd_surgery$z*(sum(amplified_2HG_surgery)/(sum(amplified_2HG_biopsy, na.rm = T)+sum(amplified_2HG_surgery)))
+kd_surgery$x = kd_surgery$x + sub_dim$width[1]+300
+
+kd_combined = list(x =c(kd_biopsy$x,
+                        kd_surgery$x),
+                   y =c(kd_biopsy$y,
+                        kd_surgery$y),
+                   z = cbind(kd_biopsy$z,
+                        kd_surgery$z)
+                   )
+kd_biopsyl = list(x =c(kd_biopsy$x),
+                   y =c(kd_biopsy$y),
+                   z = cbind(kd_biopsy$z))
+kd_surgeryl = list(x =c(kd_surgery$x),
+                   y =c(kd_surgery$y),
+                   z = (kd_surgery$z))
+Noax <- list(
+  title = "",
+  zeroline = FALSE,
+  showline = FALSE,
+  showticklabels = FALSE,
+  showgrid = FALSE
+) 
+
+item = kd_surgeryl
+fig <- plot_ly(x = item$x, y = item$y, z = item$z) %>% 
+  add_surface(colorscale = list(c(0,1),c("#30f200","#f20000")),
+              cmin = 0, cmax = max(kd_combined$z)) %>% 
+  layout(
+    scene = list(
+      aspectmode = "manual",
+      aspectratio = list(x = 1, y = 1, z = 1),
+      xaxis = Noax,
+      yaxis = Noax,
+      zaxis = list(
+        range = c(0, max(kd_combined$z)),
+        title = 'Intensity',
+        titlefont = list(size = 14, color = 'blue'),
+        tickfont = list(size = 12, color = 'blue')
+      )
+    )
+  )
+
+
+fig
+# htmlwidgets::saveWidget(as_widget(fig), paste0("/stornext/Bioinf/data/lab_brain_cancer/manuscripts/2024_AnHeart/Figures_and_tables/Vector_Files/Spatial_Metabolomics/density_map/pat8_surgery_",met,".html"))
+
+item2 = kd_biopsyl
+fig2 <- plot_ly(x = item2$x, y = item2$y, z = item2$z) %>% 
+  add_surface(colorscale = list(c(0,1),c("#30f200","#f20000")),
+              cmin = 0, cmax = max(kd_combined$z)) %>% 
+  layout(
+    scene = list(
+      aspectmode = "manual",
+      aspectratio = list(x = 1, y = 1, z = 1),
+      xaxis = Noax,
+      yaxis = Noax,
+      zaxis = list(
+               range = c(0, max(kd_combined$z)),
+        title = 'Intensity',
+        titlefont = list(size = 14, color = 'blue'),
+        tickfont = list(size = 12, color = 'blue')
+      )
+    )
+  )
+
+
+fig2
+library(htmltools)
+html = tagList(fig2, fig)
+save_html(html, paste0("~/anheart/pat3_biopsy_surgery_",met,".html"))
+}
+```
