@@ -1,0 +1,216 @@
+---
+title: "Nuclei to transcript niche hex bins"
+output: html_document
+params:
+  sample:
+    label: "Sample Name"
+    input: text
+    value: A-05_post-treatment
+---
+
+The following code (parameterised report) relates to the processing and mapping of Xenium spatial transcriptomics nuclei to transcript niche hexbins (from GraphSAGE output).
+
+Processing Xenium spatial transcriptomics sample:
+`r params$sample`
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(SingleCellExperiment)
+library(scran)
+library(ggplot2)
+library(hexbin)
+library(pheatmap)
+library(RColorBrewer)
+library(data.table)
+library(readr)
+
+transcript_niche_color_list <- c(`0` = "#9FCF87",
+                                 `1` = "#F0A0FF", 
+                                 `2` = "#9068AC",
+                                 `3` = "#F77800",
+                                 `4` = "#FFCC99",
+                                 `5` = "#2BCE48",
+                                 `6` = "#C39C94",
+                                 `7` = "#005C31")
+```
+
+# Load data
+
+```{r}
+spe <- readRDS(paste0("/data/process/spe_", params$sample, "_processed.rds"))
+cells <- fread(paste0("/data_processed/ST/", params$sample, "/cells.csv.gz"))
+cells <- cells[cells$cell_id %in% colnames(spe), ]
+
+bins <- read.csv(paste0("/output/graphsage/", params$sample, "_hexbin_info.csv"))
+bins <- bins[bins$niche != "white", ]
+
+summary(cells)
+summary(bins)
+```
+
+# Avg transcripts per bin
+
+```{r}
+mean(bins$count, na.rm = TRUE)
+```
+
+# Niche percentages
+
+```{r}
+niche_percentage <- bins %>%
+  group_by(niche) %>%
+  summarise(count = n()) %>% 
+  ungroup() %>%
+  mutate(total_bins = sum(count),  
+         percentage = (count / total_bins) * 100) 
+niche_percentage 
+```
+
+# Assign cells to transcript-based niches
+
+Assign based on euclidean distance of each nuclei centroid to the hex bin centroids (based on min distance)
+
+```{r}
+# uncomment for large samples (run functions in chunks)
+#cells_to_bins <- function(cells, bins, chunk_size = 1000) {
+#    if(nrow(cells) == 0 || nrow(bins) == 0) {
+#        stop("Error: 'cells' or 'bins' data frame is empty.")
+#    }
+#
+#    closest_bins_results <- data.frame(cell_index = integer(), closest_bin = integer())
+#
+#    for (start_idx in seq(1, nrow(cells), by = chunk_size)) {
+#        end_idx <- min(start_idx + chunk_size - 1, nrow(cells))
+#        cells_chunk <- cells[start_idx:end_idx, ]
+#
+#        distances <- expand.grid(cell_index = 1:nrow(cells_chunk), bin_index = 1:nrow(bins)) %>%
+#            mutate(
+#                cell_x = cells_chunk$x_centroid[cell_index],
+#                cell_y = cells_chunk$y_centroid[cell_index],
+#                bin_x = bins$x[bin_index],
+#                bin_y = bins$y[bin_index],
+#                distance = sqrt((cell_x - bin_x)^2 + (cell_y - bin_y)^2)
+#            )
+#
+#        closest_bins_chunk <- distances %>%
+#            group_by(cell_index) %>%
+#            slice_min(order_by = distance, n = 1) %>%
+#            ungroup() %>%
+#            select(cell_index, closest_bin = bin_index)
+#
+#        closest_bins_chunk$cell_index <- closest_bins_chunk$cell_index + start_idx - 1
+#        closest_bins_results <- rbind(closest_bins_results, closest_bins_chunk)
+#    }
+#
+#    # Ensure closest_bins_results has an entry for every cell
+#    if (nrow(closest_bins_results) < nrow(cells)) {
+#        stop("Not all cells have a closest bin computed. Check your distance calculations and chunk logic.")
+#    }
+#
+#    # Join and mutate to create closest_bin_id
+#    cells <- cells %>%
+#        mutate(cell_index = row_number()) %>%
+#        left_join(closest_bins_results, by = "cell_index") %>%
+#        mutate(closest_bin_id = bins$bin[closest_bin])
+#
+#    # Check for any missing values in the final column
+#    if (anyNA(cells$closest_bin_id)) {
+#        stop("Missing 'closest_bin_id' values after join. Check bin indices and bins data.")
+#    }
+#
+#    select(cells, -closest_bin, -cell_index)
+#}
+
+#cells <- cells_to_bins(cells, bins, chunk_size = 1000)
+
+
+cells_to_bins <- function(cells, bins) {
+  browser()
+  if(nrow(cells) == 0 || nrow(bins) == 0) {
+    stop("Error: 'cells' or 'bins' data frame is empty.")
+  }
+  distances <- expand.grid(cell_index = 1:nrow(cells), bin_index = 1:nrow(bins))
+
+  distances <- distances %>%
+    mutate(
+      cell_x = cells$x_centroid[cell_index],
+      cell_y = cells$y_centroid[cell_index],
+      bin_x = bins$x[bin_index],
+      bin_y = bins$y[bin_index]
+    )
+  
+  # Euclidean distance
+  distances <- distances %>%
+    mutate(distance = sqrt((cell_x - bin_x)^2 + (cell_y - bin_y)^2))
+  
+  # determine closest bins by finding the min distance for each cell
+  closest_bins <- distances %>%
+    group_by(cell_index) %>%
+    slice_min(order_by = distance, n = 1) %>%
+    ungroup() %>%
+    select(cell_index, closest_bin = bin_index)
+  
+  cells <- cells %>%
+    mutate(cell_index = row_number()) %>%
+    left_join(closest_bins, by = "cell_index") %>%
+    mutate(closest_bin_id = bins$bin[closest_bin]) %>%
+    select(-closest_bin, -cell_index) 
+  
+  return(cells)
+  
+}
+
+cells <- cells_to_bins(cells, bins)
+write_csv(cells, file = paste0("/output/graphsage/niche_8_binwidth70/", params$sample, "_cells2niches.csv"))
+
+gc()
+```
+
+# Prepare dataframe
+
+```{r}
+df_spe <- as.data.frame(colData(spe))
+df_spe$annotation <- factor(df_spe$annotation)
+df_spe$x <- cells$x_centroid[match(rownames(df_spe), cells$cell_id)]
+df_spe$y <- cells$y_centroid[match(rownames(df_spe), cells$cell_id)]
+df_spe$bin <- cells$closest_bin_id[match(rownames(df_spe), cells$cell_id)]
+df_spe$niche <- bins$niche[match(df_spe$bin, bins$bin)]
+
+annotation_proportions <- df_spe %>%
+  group_by(annotation) %>%
+  summarise(count = n(), .groups = 'drop') %>%
+  mutate(total_count = sum(count, na.rm = TRUE), 
+         proportion = (count / total_count) * 100)
+annotation_proportions
+```
+
+# Avg cells per bin
+
+```{r}
+df_spe %>%
+  group_by(bin) %>%
+  summarise(cell_count = n()) %>%  
+  summarise(average_cells = mean(cell_count)) 
+```
+
+# Neighbourhood enrichment
+
+```{r}
+res <- table(df_spe$niche, df_spe$annotation)
+res_enrich <- res/chisq.test(res)$expected
+
+annotations <- data.frame(Niche = as.factor(rownames(res_enrich)))
+rownames(annotations) <- rownames(res_enrich)
+
+plot <- pheatmap(t(res_enrich), color = c(rev(colorRampPalette(brewer.pal(9, "Blues"))(10)), 
+                               colorRampPalette(brewer.pal(9, "YlOrRd"))(9)), 
+           annotation_col = annotations,
+         annotation_colors = list(Niche = transcript_niche_color_list),
+         breaks=c(seq(0, 1, 0.1), seq(2, 5, 1), seq(6, 10, 1)))
+
+plot
+
+ggsave(paste0("/output/graphsage/", params$sample, "_heatmap.png"), plot = plot)
+```
+
