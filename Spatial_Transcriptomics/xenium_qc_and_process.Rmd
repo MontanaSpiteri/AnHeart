@@ -1,0 +1,127 @@
+---
+title: "Processing & quality control of Xenium spatial transcriptomics data"
+output: html_document
+params:
+  sample: "sample name"
+  neighbours:
+    label: "Clustering Nearest Neighbours:"
+    input: slider
+    value: 40
+    min: 30
+    max: 80
+---
+
+The following code (parameterised report) relates to the processing and quality control of Xenium spatial transcriptomics data
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(Seurat)
+library(SeuratObject)
+library(SingleR)
+library(ggplot2)
+library(SingleCellExperiment)
+library(pals)
+library(intrinsicDimension)
+library(reticulate)
+library(readxl)
+library(viridis)
+library(dplyr)
+library(magrittr)
+library(BiocParallel)
+library(BiocNeighbors)
+library(BiocSingular)
+library(bluster)
+library(scater)
+library(scuttle)
+library(scran)
+library(org.Hs.eg.db)
+library(ggrepel)
+library(stringi)
+```
+
+Processing Xenium spatial transcriptomics sample - `r params$sample`
+
+# Retain nuclei transcripts
+
+```{r}
+#load target sample
+large_tran <- fread(paste0('/data_processed/ST/', params$sample, '/transcripts.csv.gz'), sep = ',')
+smol_tran <- large_tran[large_tran$nucleus_distance == 0,]
+
+#remove low quality transcripts (qv <20)
+smol_tran <- smol_tran[as.numeric(smol_tran$qv)>=20,]
+
+#turn into matrix
+cell_list <- split(smol_tran$feature_name, smol_tran$cell_id)
+cell_list <- lapply(lapply(cell_list,factor,levels = sort(unique(smol_tran$feature_name))),table)
+cell_list <- lapply(cell_list, as.integer)
+cell_matrix <- matrix(unlist(cell_list), ncol = length(cell_list), byrow = F)
+colnames(cell_matrix) <- names(cell_list)
+rownames(cell_matrix) <- sort(unique(smol_tran$feature_name))
+sparse_mat <- as.sparse(cell_matrix)
+
+#turn into SingleCellExperiment
+spe <- SingleCellExperiment(assay = list('counts' = sparse_mat))
+
+rm(large_tran)
+rm(smol_tran)
+rm(cell_matrix)
+rm(cell_list)
+gc()
+
+saveRDS(spe, paste0('/data/tmp/spe_', params$sample, '.rds'))
+```
+
+# Load Xenium data
+
+```{r}
+spe <- readRDS(paste0("/data/tmp/spe_", params$sample, ".rds"))
+spe$sample <- params$sample
+```
+
+# Filter & Normalise
+
+```{r}
+spe <- spe[,colSums(assay(spe, 'counts'))>20]
+spe <- logNormCounts(spe, assay.type = 'counts')
+```
+
+# Dimension Reduction
+
+```{r}
+set.seed(0010101010)
+spe <- runPCA(spe, ncomponents=50,
+    BSPARAM=BiocSingular::IrlbaParam(),  BPPARAM=MulticoreParam(10))
+
+dim_est <- maxLikGlobalDimEst(reducedDim(spe, "PCA"), k=20, unbiased=TRUE)
+dim_est <- ceiling(dim_est$dim.est)
+print(dim_est)
+
+reducedDim(spe, "PCA") <- reducedDim(spe, "PCA")[,1:dim_est] 
+
+set.seed(0010101010)
+spe <- runUMAP(spe, dimred="PCA", name = 'UMAP',
+   BPPARAM=MulticoreParam(10), spread = 1, min_dist = 0.1)
+
+scater::plotReducedDim(spe, dimred = "UMAP", color_by = "sample")
+```
+
+## Clustering
+
+* The number of nearest neighbours used was `r params$neighbours`
+
+```{r}
+set.seed(0010101010)
+clust.leiden <- clusterCells(spe, use.dimred="PCA", 
+    BLUSPARAM=SNNGraphParam(k=params$neighbours, type="rank", cluster.fun="leiden"))
+table(clust.leiden)
+colData(spe)$Cluster <- clust.leiden
+
+scater::plotReducedDim(spe, dimred = "UMAP", color_by = "Cluster")
+```
+
+# Save output
+
+```{r}
+saveRDS(spe, file=paste0("/data/process/spe_", params$sample, "_processed.rds"))
+```

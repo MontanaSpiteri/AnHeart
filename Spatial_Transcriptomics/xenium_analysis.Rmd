@@ -1,0 +1,639 @@
+---
+title: "Analysis of Xenium spatial transcriptomics data"
+output: html_document
+---
+
+The following code relates to the analysis of Xenium spatial transcriptomics data.
+Each sample was analysed separately using this same script (Sample A-05_post-treatment used as an example here).
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+library(SingleCellExperiment)
+library(data.table)
+library(reticulate)
+
+colours_anno <- c("#F28482", "#9D4EDD", "#6A994E", "#3A7CA5", "#EF233C",
+               "#F9C8C7", "#CDDEB9", "#A7C957", "#63A2C8", "#000000", "#FFEA00", "#F4F3EE",
+               "#FAA307", "#FFBA08", "#FFD60A", "#E85D04", "#F48C06", "#F2CC8F",
+               "#656D4A", "#A4AC86", "#B6AD90", "#7F4F24", "#A68A64", "#D6D1C1",
+               "#000000", "#ADB5BD",
+               "#9D0208")
+
+names(colours_anno) <- c("AC-like", "MES-like", "OPC-like", "NPC-like", "Progenitor",
+                      "Astrocyte", "Oligodendrocyte", "OPC", "Neuron", "Vasculature", "Immune", "Unknown",
+                      "T Cell", "NK Cell", "B Cell", "CD8 T Cell", "CD4 T Cell", "T Reg Cell", 
+                      "Dendritic Cell", "Neutrophil", "Monocyte", "Microglia", "Macrophage", "Mast Cell",
+                      "Endothelial", "Mural",
+                      "Death")
+
+transcript_niche_color_list <- c(`0` = "#9FCF87",
+                                 `1` = "#F0A0FF", 
+                                 `2` = "#9068AC",
+                                 `3` = "#F77800",
+                                 `4` = "#FFCC99",
+                                 `5` = "#2BCE48",
+                                 `6` = "#C39C94",
+                                 `7` = "#005C31")
+```
+
+# Load processsed/annotated spatial data
+
+```{r}
+spe <- readRDS("/data/process/spe_A-05_post-treatment_processed.rds")
+
+df_polygons_nuc <- fread('/data_processed/ST/A-05_post-treatment/nucleus_boundaries.csv.gz')
+df_polygons <- fread('/data_processed/ST/A-05_post-treatment/cell_boundaries.csv.gz')
+
+df_polygons$Anno <- as.character(spe$annotation[match(df_polygons$cell_id, spe$cell_id)])
+df_polygons$Anno[is.na(df_polygons$Anno)] <- "Not available"
+
+df_polygons_nuc$Anno <- as.character(spe$annotation[match(df_polygons_nuc$cell_id, spe$cell_id)])
+df_polygons_nuc$Anno[is.na(df_polygons_nuc$Anno)] <- "Not available"
+
+cells <- fread('/data_processed/ST/A-05_post-treatment/cells.csv.gz')
+spe$x <- cells$x_centroid[match(colnames(spe), cells$cell_id)]
+spe$y <- cells$y_centroid[match(colnames(spe), cells$cell_id)]
+
+df <- reducedDim(spe, "UMAP")
+df <- as.data.frame(df)
+df$Sample <- spe$sample
+df$annotation <- spe$annotation
+```
+
+# Cell-type annotation spatial map
+
+```{r}
+df$x <- cells$x_centroid[match(rownames(df), cells$cell_id)]
+df$y <- cells$y_centroid[match(rownames(df), cells$cell_id)]
+  
+samp1 <- sample(1:nrow(df))
+plot <- ggplot(df[samp1,], aes(x=x[samp1], y=y[samp1])) + 
+      geom_point(col="black", size=0.9) +
+      geom_point(col="white", size=0.5) +
+      geom_point(aes(col=annotation[samp1]), size=0.3, alpha=0.75) +
+      scale_color_manual(values=colours_anno) + theme_void() +
+      guides(colour = guide_legend(override.aes = list(alpha = 1, size=3)))
+```
+
+# Cell-type proportions
+
+```{r}
+df_summary <- df %>%
+  group_by(annotation) %>%
+  summarise(Count = n(), .groups = 'drop') %>%
+  mutate(Proportion = Count / sum(Count))
+
+p <- ggplot(df_summary, aes(x = 2, y = Proportion, fill = annotation)) +
+    geom_bar(stat = "identity", width = 1) +
+    coord_polar(theta = "y") +
+    xlim(0.5, 2.5) +
+    theme_void() +
+    labs(fill = "annotation") +
+    scale_fill_manual(values = colours_anno) 
+```
+
+# Prepare spatial transcriptomics data for CytoSPACE integration with relevant snRNA-seq data (multi-omics integration)
+
+Refer to `snRNA-seq/snrna-seq_analysis.Rmd` for information regarding preparation of snRNA-seq data.
+
+```{r}
+# first remove any populations not available in corresponding snRNA-seq sample dataset
+spe_cyto <- spe[, !spe$annotation %in% c("NPC-like")]
+levels(spe_cyto$annotation)[levels(spe_cyto$annotation) %in% c("Microglia", "Macrophage", "Neutrophil", "T Cell")] <- "Immune"
+spe_cyto$annotation <- factor(spe_cyto$annotation)
+
+data <- as.matrix(counts(spe_cyto))
+write.table(as.data.frame(cbind(GENES=rownames(data), data)), file = "/data/process/cytospace/A-05_post-treatment_spatial_counts.txt", row.names = FALSE, col.names = TRUE, quote = FALSE, sep = "\t")
+
+annos <- data.frame(Cell_IDs=colnames(spe_cyto),
+                    CellType=spe_cyto$annotation)
+write.table(annos, file = "/data/process/cytospace/A-05_post-treatment_spatial_annos.txt", row.names = FALSE, col.names = TRUE, quote = FALSE, sep = "\t")
+
+cells <- fread('/data_processed/ST/A-05_post-treatment/cells.csv.gz')
+spe$x_centroid <- cells$x_centroid[match(colnames(spe_cyto), cells$cell_id)]
+spe$y_centroid <- cells$y_centroid[match(colnames(spe_cyto), cells$cell_id)]
+coords <- data.frame(Cell_IDs=colnames(spe_cyto),
+                     row=spe_cyto$y_centroid,
+                     col=spe_cyto$x_centroid)
+write.table(coords, file = "/data/process/cytospace/A-05_post-treatment_spatial_coords.txt", row.names = FALSE, col.names = TRUE, quote = FALSE, sep = "\t")
+```
+
+Following preparation of relevant spatial transcriptomics and snRNA-seq datasets, CytoSPACE was run: `cytospace_integration.sh`
+
+# Cell type annotation zoom-in plots
+
+```{r}
+# plot specific region
+plot_region <- function(xmin = 1000, ymin = 1000, interval = 756, save = F){
+gg2 <- df_polygons %>% filter(Anno != 'Not available')  %>% ggplot(aes(x = vertex_x, y = vertex_y)) + xlim(xmin,xmin+interval)+ ylim(ymin,ymin+interval)+
+geom_polygon(aes(fill = Anno, group = cell_id),
+colour="darkgrey", linewidth=0.15, alpha = 0.7) +
+geom_polygon(data = df_polygons_nuc[df_polygons_nuc$Anno!= 'Not available',], aes(fill = Anno, group = cell_id),
+colour="darkgrey", linewidth=0.15) +
+scale_fill_manual(values=colours_anno) + theme_minimal()
+if(save){
+ggsave(gg2,file = paste0("figures/A-05_post-treatment_polygons_", xmin, "_", ymin, ".png"), height = 4.5, width = 7.5)}
+else{
+    print(gg2)
+}
+}
+
+plot_region(2500, 7900, save = F)
+```
+
+# Gene expression zoom-in plots
+
+```{r}
+plot_region <- function(gene, xmin = 1000, ymin = 1000, interval = 756, save = F) {
+  gene_expression <- logcounts(spe)[gene, ]
+  df_polygons$gene <- gene_expression[match(df_polygons$cell_id, colnames(spe))]
+  df_polygons_nuc$gene <- gene_expression[match(df_polygons_nuc$cell_id, colnames(spe))]
+
+  gg2 <- df_polygons %>%
+    filter(!is.na(gene)) %>%
+    ggplot(aes(x = vertex_x, y = vertex_y, fill = gene)) +
+    xlim(xmin, xmin + interval) +
+    ylim(ymin, ymin + interval) +
+    geom_polygon(aes(group = cell_id),
+                 colour="darkgrey", linewidth=0.15, alpha = 0.7) +
+    scale_fill_gradient(low = "lightgrey", high = "red", limits = c(0, 4)) + 
+    labs(fill = gene) +
+    theme_classic()
+  
+  if(save) {
+    ggsave(gg2, file = paste0("figures/A-05_post-treatment_polygons_", xmin, "_", ymin, "_", gene, "_expression.svg"), height = 4.5, width = 7.5)
+  }
+}
+
+plot_region("CD69", 2700, 3900, save = F)
+```
+
+# Cell type annotation presence plots
+
+```{r}
+df_neuron <- df[df$annotation == "Neuron", ]
+
+gg1 <- ggplot() +
+  geom_point(data = df, aes(x = x, y = y), col = "black", size = 0.9) +
+  geom_point(data = df, aes(x = x, y = y), col = "white", size = 0.5) +
+  geom_point(data = df, aes(x = x, y = y), col = "#EEEEEE", size = 0.455) +
+  geom_point(data = df_neuron, aes(x = x, y = y, color = annotation), col = "red", size = 0.1) +
+  geom_density_2d(data = df_neuron, aes(x = x, y = y), col = "black", size = 0.3, adjust = 1) +
+  theme_void()
+
+df_immune <- df[df$annotation %in% c("Microglia", "Macrophage", "T Cell", "Neutrophil"), ]
+
+gg1 <- ggplot() +
+  geom_point(data = df, aes(x = x, y = y), col = "black", size = 0.9) +
+  geom_point(data = df, aes(x = x, y = y), col = "white", size = 0.5) +
+  geom_point(data = df, aes(x = x, y = y), col = "#EEEEEE", size = 0.455) +
+  geom_point(data = df_immune, aes(x = x, y = y, color = annotation), col = "red", size = 0.1) +
+  geom_density_2d(data = df_immune, aes(x = x, y = y), col = "black", size = 0.3, adjust = 1) +
+  theme_void()
+```
+
+# Cortical layer markers
+
+```{r}
+plot_combined_genes <- function(genes, spe, cells, save=FALSE) {
+  df_spe <- as.data.frame(t(logcounts(spe)))
+  df_spe$x <- cells$x_centroid[match(rownames(df_spe), cells$cell_id)]
+  df_spe$y <- cells$y_centroid[match(rownames(df_spe), cells$cell_id)]
+
+  gg1 <- ggplot(df_spe, aes(x = x, y = y)) +
+    geom_point(color = "black", size = 1.8) +
+    geom_point(color = "white", size = 1.5) +
+    geom_point(color = "lightgrey", size = 1.3) +
+    theme_void()
+  df_long <- df_spe %>%
+    pivot_longer(cols = all_of(genes), names_to = "gene", values_to = "expression") %>%
+    filter(expression >= 1) %>%
+    arrange(gene, expression)
+  gg1 <- gg1 +
+    geom_point(data = df_long, aes(color = gene), size = 1, alpha = 0.7) +
+    scale_color_viridis_d(option = "C") +
+    labs(color = "Gene")
+  
+  if(save) {
+    ggsave(gg1, file = paste0("figures/A-05_post-treatment_cortical_layers.png"))
+  } else {
+    print(gg1)
+  }
+}
+
+marker_genes <- c("NR4A2", "HS3ST4", "TSHZ2", "RORB")
+plot_combined_genes(marker_genes, spe, cells, save = F)
+```
+
+# Kontextual Co-localisation analysis of Immune cells
+
+Positive Kontextual values indicate a stronger than exprected association and negative weaker than expected. 
+
+```{r}
+spe_kon <- spe[, spe$annotation %in% c('Vasculature', 'T Cell', 'Neutrophil', 'Microglia', 'Macrophage')]
+spe_kon$annotation <- factor(spe_kon$annotation)
+immune <- c('T Cell', 'Neutrophil', 'Microglia', 'Macrophage')
+vasculature <- c('Vasculature')
+all <- c(vasculature, immune)
+
+parentDf <- parentCombinations(
+  all = all,
+  immune,
+  vasculature
+)
+spe_kon$imageID <- "1"
+
+# Kontextual on all relationships
+output <- Kontextual(
+  cells = spe_kon,
+  parentDf = parentDf,
+  r = 100,
+  cores = 4,
+  inhom = TRUE,
+  cellType = "annotation",
+  spatialCoords = c("x", "y"),
+  imageID = "imageID"
+)
+
+# output direction from_to
+bigDiff <- (output$original - output$kontextual)
+head(output[order(bigDiff),], 10)
+
+curves <- kontextCurve(
+  cells = spe_kon,
+  from = "Macrophage",
+  to = "Vasculature",
+  parent = immune,
+  rs = seq(10, 250, 20),
+  image = "1",
+  cellType = "annotation",
+  cores = 4,
+  inhom = TRUE
+)
+# uncomment for other immune cell populations
+#plot_tcell <- kontextPlot(curves)
+#plot_macro <- kontextPlot(curves)
+
+filtered_tcell <- plot_tcell$data %>%
+  filter(name != "original") %>%
+  mutate(name = if_else(name == "kontextual", "T Cell", name))
+
+filtered_macro <- plot_macro$data %>%
+  filter(name != "original") %>%
+  mutate(name = if_else(name == "kontextual", "Macrophage", name))
+
+combined_data <- rbind(filtered_tcell, filtered_macro)
+
+combined_plot <- ggplot(combined_data, aes(x = r, y = value, color = name, group = name)) +
+  geom_smooth(se = FALSE) + 
+  geom_point() + 
+  ggtitle("A-05_post-treatment - Co-localisation to Vasculature") +
+  labs(y = "Kontextual Relationship Value", x = "Radius (r)") +
+  scale_color_manual(values = colours_anno) +  
+  theme_classic() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black")  
+```
+
+
+
+# Transcript niche analysis
+
+```{r}
+df_spe <- lapply(samples, function(i) {
+  spe <- readRDS(paste0("/data/process/spe_", i, "_processed.rds"))
+  bins <- read.csv(paste0("/output/graphsage/", i, "_hexbin_info.csv"))
+  cells <- read.csv(paste0("/output/graphsage/", i, "_cells2niches.csv"))
+  bins <- bins[bins$niche != "white", ]
+
+  df_spe <- as.data.frame(colData(spe))
+  df_spe$annotation <- factor(df_spe$annotation)
+  df_spe$x_centroid <- cells$x_centroid[match(rownames(df_spe), cells$cell_id)]
+  df_spe$y_centroid <- cells$y_centroid[match(rownames(df_spe), cells$cell_id)]
+  df_spe$bin <- cells$closest_bin_id[match(rownames(df_spe), cells$cell_id)]
+  df_spe$niche <- bins$niche[match(df_spe$bin, bins$bin)]
+  df_spe$x_bin <- bins$x[match(df_spe$bin, bins$bin)]
+  df_spe$y_bin <- bins$y[match(df_spe$bin, bins$bin)]
+
+  return(df_spe)
+})
+df_spe <- bind_rows(df_spe)
+
+#write.csv(df_spe, file = "/output/graphsage/niche_assignments_all.csv", row.names = TRUE)
+df_spe <- read_csv("/output/graphsage/niche_assignments_all.csv")
+```
+
+## Transcript niche proportion plots
+
+```{r}
+proportions_df <- df_spe %>%
+  group_by(sample, annotation) %>%  
+  summarise(count = n(), .groups = 'drop') %>%  
+  group_by(sample) %>% 
+  mutate(total = sum(count), 
+         proportion = count / total) 
+
+plot <- ggplot(proportions_df, aes(x = sample, y = proportion, fill = annotation)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = colours_anno) +
+  theme_classic() +
+  labs(x = NULL, y = "Proportion of Total", fill = "Annotation") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 3)) 
+```
+
+```{r}
+file_list <- list.files(path = "/analysis/output/graphsage/", pattern = "*percentage.csv", full.names = TRUE)
+
+all_data <- file_list %>%
+  map_df(~read_csv(.x) %>%
+           mutate(Sample = tools::file_path_sans_ext(basename(.x)))) %>%
+  mutate(Proportion = percentage / 100) %>%
+  filter(niche != "white") %>% # remove white niche (<10 transcripts per hexbin)
+  group_by(Sample) %>%
+  mutate(Proportion = Proportion / sum(Proportion)) %>%
+  ungroup() %>%
+  mutate(Niche = as.factor(niche)) %>%
+  dplyr::select(Sample, Niche, Proportion)
+
+plot <- ggplot(all_data, aes(x = Sample, y = Proportion, fill = Niche)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = transcript_niche_color_list) +
+  theme_classic() +
+  labs(x = NULL, y = "Proportion of Total", fill = "Transcript Niche") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 3)) 
+
+# donut proportion plots
+plot_donut <- function(patient_data, patient_id) {
+  p <- ggplot(patient_data, aes(x = 2, y = Proportion, fill = Niche)) +
+    geom_bar(stat = "identity", width = 1) +
+    coord_polar(theta = "y") +
+    xlim(0.5, 2.5) +
+    theme_void() +
+    labs(title = paste(patient_id),
+         fill = "Annotation") +
+    scale_fill_manual(values = transcript_niche_color_list)
+  return(p)
+}
+
+for(i in unique(all_data$Sample)) {
+  patient_data <- filter(all_data, Sample == i)
+  print(i)
+  p <- plot_donut(patient_data, i)
+  print(p)
+}
+```
+
+## Transcript niche neighbourhood enrichment
+
+```{r}
+# chi-square test
+res <- table(df_spe$niche, df_spe$annotation)
+res_enrich <- res/chisq.test(res)$expected
+
+annotations <- data.frame(Niche = as.factor(rownames(res_enrich)))
+rownames(annotations) <- rownames(res_enrich)
+
+plot <- pheatmap(t(res_enrich), color = c(rev(colorRampPalette(brewer.pal(9, "Blues"))(10)), 
+                               colorRampPalette(brewer.pal(9, "YlOrRd"))(9)), 
+           annotation_col = annotations,
+         annotation_colors = list(Niche = transcript_niche_color_list),
+         breaks=c(seq(0, 1, 0.1), seq(2, 5, 1), seq(6, 10, 1)))
+```
+
+## Cell assignment to transcript niches
+
+```{r}
+# barplot
+df_props <- df_spe %>%
+  dplyr::group_by(annotation, niche) %>%  
+  dplyr::summarise(count = n(), .groups = 'drop') %>%
+  dplyr::group_by(annotation) %>%  
+  dplyr::mutate(proportion = count / sum(count)) %>%
+  dplyr::ungroup() %>%
+  complete(annotation, niche, fill = list(proportion = 0))  
+df_props$niche <- factor(df_props$niche, levels = rev(unique(df_props$niche)))
+
+plot <- ggplot(df_props, aes(x = niche, y = annotation, size = proportion, color = annotation)) +
+  geom_hline(yintercept = seq_along(unique(df_props$annotation)), color = "grey90") +  
+  geom_point() +
+  scale_size_area(max_size = 10) +  
+  theme_classic() +
+  labs(
+    x = NULL,
+    y = NULL,
+    size = "Proportion"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "right"
+  ) + scale_colour_manual(values = colours_anno) +
+  guides(color = FALSE) + coord_flip()
+```
+
+```{r}
+# dotplot
+# double normalisation (across niches and annotations)
+df_counts <- df_spe %>%
+  dplyr::count(annotation, niche)
+
+df_props <- df_counts %>%
+  dplyr::group_by(niche) %>%
+  dplyr::mutate(proportion_within_niche = n / sum(n)) %>%
+  dplyr::ungroup() %>%
+  dplyr::group_by(annotation) %>%
+  dplyr::mutate(proportion_across_annotations = proportion_within_niche / sum(proportion_within_niche)) %>%
+  dplyr::ungroup() %>%
+  tidyr::complete(annotation, niche, fill = list(proportion_across_annotations = 0))
+df_props$niche <- factor(df_props$niche, levels = rev(unique(df_props$niche)))
+
+plot <- ggplot(df_props, aes(x = niche, y = annotation, size = proportion_across_annotations, color = annotation)) +
+  geom_point() +
+  scale_size_area(max_size = 10) +
+  theme_classic() +
+  labs(
+    x = NULL, 
+    y = NULL,
+    size = "Normalised Proportion"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "right"
+  ) +
+  scale_colour_manual(values = colours_anno) +
+  guides(color = FALSE) +
+  coord_flip()
+```
+
+
+
+# CytoSPACE integrated dataset
+
+```{r}
+df_niche <- read.csv("/output/graphsage/niche_assignments_all.csv")
+spe <- readRDS("/analysis/output/cytospace/A-05_post-treatment_cytospace_spe.rds")
+df_niche <- df_niche[df_niche$...1 %in% spe$SpotID, ]
+df_niche <- df_niche[match(spe$SpotID, df_niche$...1), ]
+colData(spe) <- DataFrame(colData(spe), df_niche)
+```
+
+# Infer gene module expression from CytoSPACE output using transcript niche hex bins
+
+## Synaptic signaling in T7 neurons only
+
+```{r}
+gene_sets <- readRDS("/public_datasets/gene_sets/all_genesets_list.rds")
+interest <- gene_sets <- gene_sets[grep("GOBP_SYNAPTIC_SIGNALING", names(gene_sets))]
+interest <- interest[[1]]
+
+#neuron cells only
+spe_orig <- spe
+bin_summary_orig <- as.data.frame(colData(spe_orig)) %>%
+  dplyr::mutate(color_fill = NA)
+spe <- spe[, !is.na(spe$annotation) & spe$annotation == "Neuron"]
+
+interest_genes <- intersect(interest, rownames(logcounts(spe)))
+bin_summary <- as.data.frame(colData(spe)) %>%
+  dplyr::mutate(avg_expr = colMeans(logcounts(spe)[interest_genes, , drop = FALSE])) %>%
+  dplyr::group_by(x_bin, y_bin) %>%  
+  dplyr::summarise(avg_expression = mean(avg_expr, na.rm = TRUE), .groups = 'drop') %>%
+  dplyr::filter(!is.na(x_bin) & !is.na(y_bin))
+
+niche_data <- as.data.frame(colData(spe)) %>%
+  dplyr::select(x_bin, y_bin, niche) %>%
+  distinct(x_bin, y_bin, niche, .keep_all = TRUE)
+bin_summary <- bin_summary %>%
+  dplyr::left_join(niche_data, by = c("x_bin", "y_bin"))
+
+# Transcript niche 7 (T7) only
+bin_summary <- bin_summary %>%
+  mutate(color_fill = ifelse(niche == 7, avg_expression, NA))  # NA will be replaced by grey
+gg1 <- ggplot(bin_summary, aes(x = x_bin, y = y_bin, fill = color_fill)) +
+  geom_hex(stat = "identity") + 
+  scale_fill_viridis_c(
+           na.value = "lightgrey",  # Set non-niche 7 bins to grey
+           breaks = c(0.3, 0.4, 0.5, 0.6, 0.7), 
+           labels = c("0.3", "0.4", "0.5", "0.6", "0.7"),  
+           limits = c(0.3, 0.7),
+           name = "Avg log expression"
+    ) +
+  labs(title = "GOBP_SYNAPTIC_SIGNALING T7 Neurons",
+       x = "X",
+       y = "Y") +
+  theme_void() +
+  guides(fill = guide_colorbar(title = "Avg Expr", title.position = "top", title.hjust = 0.5))
+```
+
+## Inflammation response
+
+```{r}
+interest <- gene_sets[grep("GOBP_INFLAMMATORY_RESPONSE", names(gene_sets))]
+interest <- interest[[1]]
+
+interest_genes <- intersect(interest, rownames(logcounts(spe)))
+bin_summary <- as.data.frame(colData(spe)) %>%
+  dplyr::mutate(avg_expr = colMeans(logcounts(spe)[interest_genes, , drop = FALSE])) %>%
+  dplyr::group_by(x_bin, y_bin) %>%  
+  dplyr::summarise(avg_expression = mean(avg_expr, na.rm = TRUE), .groups = 'drop') %>%
+  dplyr::filter(!is.na(x_bin) & !is.na(y_bin))
+
+gg1 <- ggplot(bin_summary, aes(x = x_bin, y = y_bin, fill = avg_expression)) +
+  geom_hex(stat = "identity") + 
+  scale_fill_viridis_c() +
+  labs(title = "GOBP_INFLAMMATORY_RESPONSE",
+       x = "X",
+       y = "Y",
+       fill = "Avg log expr") +
+  theme_void()
+```
+
+# Tumor & immune co-localisation vs inflammatory response
+
+Tumor cells within a 30um radius assumed as co-localised to immune cells for this analysis
+
+```{r}
+spe$annotation[spe$annotation %in% c("AC-like", "OPC-like", "Progenitor", "NPC-like")] <- "Tumour"
+spe$annotation[spe$annotation %in% c("Macrophage", "T Cell", "Microglia", "Neutrophil")] <- "Immune"
+spe_adapt <- spe[, spe$annotation %in% c("Immune", "Tumour")]
+spe_adapt$annotation <- factor(spe_adapt$annotation)
+
+df <- data.frame(cell_id = spe_adapt$SpotID, x = spe_adapt$x_centroid, y = spe_adapt$y_centroid, type = spe_adapt$annotation)
+sf_pts <- sfheaders::sf_point(df, x = 'x', y = 'y', keep = TRUE)
+
+# buffer of 30um around each Immune cell
+sf_pts$geometry <- sf::st_geometry(sf_pts)
+immune_cells <- sf_pts[sf_pts$type == "Immune", ]
+immune_buffers <- st_buffer(immune_cells, dist = 30)
+
+# Tumour cells within any Immune cell buffer
+tumor_cells <- sf_pts[sf_pts$type == "Tumour", ]
+colocalization <- st_join(tumor_cells, immune_buffers, join = st_intersects)
+
+# co-localization status
+spe_adapt$colocal <- ifelse(spe_adapt$SpotID %in% colocalization$cell_id.x[!is.na(colocalization$cell_id.y)], "co-localized", "not co-localized")
+spe_adapt$colocal <- factor(spe_adapt$colocal, levels = c("co-localized", "not co-localized"))
+
+# t-test
+spe_adapt <- spe_adapt[, spe_adapt$annotation == "Tumour"]
+spe_adapt$avg_expr_adaptive_immune <- colMeans(logcounts(spe_adapt)[interest_genes, ], na.rm = TRUE)
+
+tumor_co <- spe_adapt[, spe_adapt$colocal == "co-localized"]
+tumor_not_co <- spe_adapt[, spe_adapt$colocal == "not co-localized"]
+
+test_result <- t.test(tumor_co$avg_expr_adaptive_immune, tumor_not_co$avg_expr_adaptive_immune, alternative = "greater")
+test_result
+```
+
+# Synaptic gene dotplots (Neurons only)
+
+```{r}
+genes_interest <- c("AKAP12", "CNTN2", "DCC", "EPHA4", "GABRB3", "GRM8", "KCNMB4", "MAP1B", "MEF2C", "NTNG1", "PTPRA", "SLC24A2")
+df_genes <- lapply(samples, function(i) {
+  spe <- readRDS(paste0("/data/process/spe_", i, "_processed.rds"))
+  print(dim(spe))
+  keep <- intersect(genes_interest, rownames(spe))
+  df_genes <- as.data.frame(as.matrix(t(logcounts(spe)[keep, ])))
+  return(df_genes)
+})
+df_genes <- bind_rows(df_genes)
+df_genes <- cbind(df_spe, df_genes)
+# Neuron cells only
+df_genes <- df_genes[df_genes$annotation == "Neuron", ]
+keep <- intersect(colnames(df_genes), genes_interest)
+```
+
+```{r}
+calculate_stats <- function(df, gene) {
+  df %>%
+    dplyr::group_by(niche, Sample_ID) %>%
+    dplyr::summarise(
+      Unique_Bins = n_distinct(bin),  
+      Proportion = mean(get(gene) > 0, na.rm = TRUE),
+      Avg_Expression = mean(get(gene), na.rm = TRUE),
+      .groups = 'drop'
+    ) %>%
+    dplyr::filter(Unique_Bins >= 20) %>%  #filtering based on bin count (only keep Sample_ID/niche combos with > 20 bins)
+    dplyr::mutate(Gene = gene)
+}
+df_stats <- map_df(keep, ~ calculate_stats(df_genes, .x))
+df_stats$niche <- factor(df_stats$niche)
+
+df_stats <- df_stats %>%
+  group_by(Gene) %>%
+  mutate(Z_Score = scale(Avg_Expression)) %>%
+  ungroup()
+df_stats <- df_stats[!df_stats$Sample_ID == "A-01_post-treatment", ]
+df_stats$Sample_ID <- factor(df_stats$Sample_ID, levels = c("A-05_post-treatment", "A-05_pre-treatment", "A-03_post-treatment", "A-05_pre-treatment", "O-01_post-treatment", "O-01_pre-treatment"))
+
+# include missing factor levels
+template_df <- expand.grid(Sample_ID = levels(df_stats$Sample_ID), niche = unique(df_stats$niche))
+df_stats_complete <- merge(template_df, df_stats, by = c("Sample_ID", "niche"), all.x = TRUE)
+
+plot <- ggplot(df_stats_complete, aes(x = niche, y = Sample_ID, size = Proportion, color = Z_Score)) +
+  geom_point() +
+  scale_color_gradient2(low = "blue", mid = "lightyellow", high = "red", midpoint = 0, name = "Z-Score of Avg Expression") +
+  facet_wrap(~ Gene) +
+  theme_classic() +
+  labs(x = NULL,
+       y = NULL,
+       size = "Neuron Proportion Expressing")
+```
+
