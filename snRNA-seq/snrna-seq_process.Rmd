@@ -1,0 +1,176 @@
+---
+title: "`r params$doc_title`"
+output: html_document
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+params:
+  doc_title: "Processing of snRNA-seq data"
+  Author: "Namei"
+  sample:
+    label: "Sample Name"
+    input: text
+    value: A-01_Pre-treatment
+  method:
+    label: "Clustering Method:"
+    input: select
+    choices: [Leiden, Louvain]
+    value: Leiden
+  neighbours:
+    label: "Clustering Nearest Neighbours:"
+    input: slider
+    value: 25
+    min: 5
+    max: 45
+author: "`r params$Author`"
+---
+
+The following code (parameterised report) relates to the processing of snRNA-seq data
+
+Processing sample:
+`r params$sample`
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(SingleCellExperiment)
+library(tidyverse)
+library(scuttle)
+library(scater)
+library(scran)
+library(ggplot2)
+library(BiocParallel)
+library(bluster)
+library(Polychrome)
+library(graphics)
+library(intrinsicDimension)
+```
+
+```{r Load, include=FALSE}
+sce <- readRDS(file = paste0("/data/tmp/", params$sample, "_sce_filtered.rds"))
+```
+
+## Normalisation
+
+* Library size normalisation and scale counts using pre-computed size factors was performed
+* Normalisation addresses any limitations that may be presented by low input material and various forms of bias or noise present from the sequencing process
+
+```{r Normalisation, include=FALSE}
+sce <- logNormCounts(sce)
+```
+
+## Variance Modelling
+
+* Variable genes detected
+* Gene variance was modelled using the top 5000 highly variable genes (HVGs)
+* All genes with a positive biological component are retained to preserve as much signal as possible across the dataset
+
+```{r Variance Modelling, echo=FALSE}
+dec.parse <- modelGeneVar(sce, block=sce$sample)
+chosen.hvgs <- getTopHVGs(dec.parse, n=5000)
+
+
+plot(dec.parse$mean, dec.parse$total, pch=16, cex=0.5,
+    xlab="Mean of log-expression", ylab="Variance of log-expression")
+curfit <- metadata(dec.parse)
+curve(curfit$trend(x), col='dodgerblue', add=TRUE, lwd=2)
+```
+
+## Dimensionality Reduction
+
+* Dimensionality reduction performed to enhance prediction quality, reduce computing time, and construct a more robust model
+
+```{r Dimensionality Reduction, echo=FALSE}
+set.seed(0010101010)
+sce <- runPCA(sce, subset_row=chosen.hvgs,
+    BSPARAM=BiocSingular::IrlbaParam())
+
+dim_est <- maxLikGlobalDimEst(reducedDims(sce)$PCA, k=20, unbiased=TRUE)
+dim_est <- as.integer(round(dim_est$dim.est))
+# check estimated dimension does not exceed the actual number of dimensions
+max_dims <- min(ncol(reducedDims(sce)$PCA), dim_est)
+reducedDim(sce, "PCA") <- reducedDim(sce, "PCA")[,1:max_dims]
+
+set.seed(0010101010)
+sce <- runUMAP(sce, dimred="PCA", 
+   BPPARAM=MulticoreParam(10), n_neighbors = 15, spread = 3, min_dist = 0.1)
+
+set.seed(0010101010)
+sce <- runTSNE(sce, dimred = "PCA") 
+
+df <- reducedDim(sce, "UMAP")
+df <- as.data.frame(df)
+df$Sample <- sce$sample
+df$Sum <- sce$sum
+df$Detected <- sce$detected
+colnames(df)[1:2] <- c("UMAP1", "UMAP2")
+
+ggplot(df[sample(1:nrow(df)),], aes(x=UMAP1, y=UMAP2, color=Sample)) + geom_point(alpha=0.5) + theme_classic() 
+ggplot(df, aes(x=UMAP1, y=UMAP2, color=log10(Sum))) + geom_point(alpha=0.5) + theme_classic() + scale_color_viridis_c()
+ggplot(df, aes(x=UMAP1, y=UMAP2, color=log10(Detected))) + geom_point(alpha=0.5) + theme_classic() + scale_color_viridis_c()
+scater::plotReducedDim(sce, 
+                       dimred = "PCA", 
+                       colour_by = "sample")
+scater::plotReducedDim(sce, 
+                       dimred = "TSNE", 
+                       colour_by = "sample")
+```
+
+* `r max_dims` dimensions taken forward
+
+## Clustering
+
+* Clustering of cells was performed using the `r params$method` method
+* The number of nearest neighbours used was `r params$neighbours`
+* Cluster analysis groups cells based on similarities in gene expression profile which may reveal hidden patterns and potential confounding factors in the dataset
+
+```{r Clustering, include=FALSE}
+if(params$method == "Leiden"){
+  
+  set.seed(0010101010)
+  Clusters <- scran::clusterCells(sce, use.dimred="PCA", 
+                             BLUSPARAM=SNNGraphParam(k=params$neighbours, type="rank", cluster.fun="leiden"))
+  
+} else {
+  
+  set.seed(0010101010)
+  Clusters <- scran::clusterCells(sce, use.dimred="PCA", 
+                             BLUSPARAM=SNNGraphParam(k=params$neighbours, type="rank", cluster.fun="louvain"))
+  
+}
+
+sce$Cluster <- Clusters
+df$Cluster <- sce$Cluster
+```
+
+#### Cluster Proportions:
+```{r, echo=FALSE}
+table(Clusters)
+```
+
+#### Per Sample Cluster Proportions:
+```{r, echo=FALSE}
+colLabels(sce) <- sce$Cluster
+table(colLabels(sce), sce$sample)
+```
+
+```{r Plot Clusters, echo=FALSE}
+cluster_number <- as.numeric(length(unique(df$Cluster)))
+colours_clusters <- Polychrome::palette36.colors(cluster_number)
+names(colours_clusters) <- 1:cluster_number
+
+ggplot(df[sample(1:nrow(df)),], aes(x=UMAP1, y=UMAP2, color=Cluster)) + geom_point(alpha=0.5) + 
+  theme_classic() +
+guides(colour = guide_legend(override.aes = list(alpha = 1, size=3))) + scale_color_manual(values=colours_clusters) 
+
+df %>%
+  dplyr::count(Cluster, Sample) %>%       
+  dplyr::group_by(Sample) %>%
+  dplyr::mutate(pct= prop.table(n) * 100) %>%
+  ggplot(aes(y=Sample, x=pct, fill=Cluster)) +
+  geom_bar(stat="identity") +
+  theme_bw()+ scale_fill_manual(values=colours_clusters) 
+```
+
+## Output File 
+
+```{r Save, include=TRUE}
+saveRDS(sce, file = paste0("/data/tmp/", params$sample, "_sce_clustered.rds"))
+```

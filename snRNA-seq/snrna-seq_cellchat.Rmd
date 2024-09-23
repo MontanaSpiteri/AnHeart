@@ -1,0 +1,311 @@
+---
+title: "Cell-cell communitation analysis of snRNA-seq data"
+output: html_document
+---
+
+The following code relates to the cell-cell communitation analysis (via CellChat) of processed snRNA-seq data.
+
+CellChat vignette {https://github.com/jinworks/CellChat/blob/main/tutorial/CellChat-vignette.Rmd}
+{https://htmlpreview.github.io/?https://github.com/jinworks/CellChat/blob/master/tutorial/CellChat-vignette.html}
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(CellChat)
+library(ComplexHeatmap)
+library(NMF)
+library(circlize)
+library(SingleCellExperiment)
+library(HDF5Array)
+library(Seurat)
+
+colours_comb <- c("#F28482", "#F9C8C7", "#FFEA00", "#63A2C8", "#CDDEB9", "#A7C957", "#6A994E", "#EF233C", "#000000")
+names(colours_comb) <- c("AC-like", "Astrocyte", "Immune", "Neuron", "Oligodendrocyte", "OPC", "OPC-like", "Progenitor", "Vasculature")
+
+colours_sample <- c("#0C7BDC", "#E66100")
+names(colours_sample) <- c("Pre-treatment", "Post-treatment")
+```
+
+# Comparative CellChat Analysis
+
+Process pre- and post-treatment samples separately with CellChat to compare the cell-cell communication profiles. 
+
+* Separate CellChat objects prepared and pre-processed via slurm: `scripts/cellchat_prep.R`
+* lowly expressed genes (<1% cells) removed to decrease noise 
+* Small cell populations removed (OPC)
+
+Participant A-04 removed from this analysis (low tumor purity)
+
+## Prepare CellChat objects
+
+```{r}
+sce_comb <- loadHDF5SummarizedExperiment("/data/process/", prefix="sce_integrated_")
+# remove participant A-04 due to low tumor purity
+sce_comb <- sce_comb[, !sce_comb$Patient == "A-04"]
+sce_comb$Patient <- factor(sce_comb$Patient)
+# remove cell populations with small number
+sce_comb <- sce_comb[, !sce_comb$annotation %in% c("OPC")]
+sce_comb$annotation <- factor(sce_comb$annotation)
+
+sce_comb <- sce_comb[!duplicated(rownames(sce_comb)), ]
+sce_comb <- sce_comb[, !duplicated(colnames(sce_comb))]
+
+dim(sce_comb)
+
+# remove lowly expressed genes (expressed in <1% of cells) to reduce noise in the dataset
+sce_comb <- sce_comb[rowSums(counts(sce_comb) > 0) >= ceiling(ncol(sce_comb) * 0.01), ]
+
+dim(sce_comb)
+
+status <- c("Pre-treatment", "Post-treatment")
+
+for(i in 1:length(status)){
+  
+  sce <- sce_comb[, sce_comb$Sample_Type == status[i]]
+  
+  cellChat <- createCellChat(object = sce, group.by = "annotation")
+  
+  CellChatDB <- CellChatDB.human
+  CellChatDB.use <- subsetDB(CellChatDB)
+  cellChat@DB <- CellChatDB.use
+  
+  cellChat <- subsetData(cellChat) 
+  future::plan("multisession", workers = 4)
+  cellChat <- identifyOverExpressedGenes(cellChat)
+  cellChat <- identifyOverExpressedInteractions(cellChat) 
+  cellChat <- projectData(cellChat, PPI.human)
+  
+  cellChat <- computeCommunProb(cellChat, type = "triMean")
+  cellChat <- filterCommunication(cellChat, min.cells = 10)
+  cellChat <- computeCommunProbPathway(cellChat)
+  cellChat <- aggregateNet(cellChat)
+  
+  saveRDS(cellChat, file = paste0("/data/process/", "cellchat_", status[i], ".rds"))
+  
+}
+```
+
+## Load separate CellChat objects 
+
+```{r}
+cellchat_pre <- readRDS("../data_v2/process/cellchat_Pre-treatment.rds")
+cellchat_pre <- netAnalysis_computeCentrality(cellchat_pre)
+cellchat_post <- readRDS("../data_v2/process/cellchat_Post-treatment.rds")
+cellchat_post <- netAnalysis_computeCentrality(cellchat_post)
+cellchat_post@meta$samples <- factor("sample2")
+
+cellchat_ls <- list(Pre-treatment = cellchat_pre, Post-treatment = cellchat_post)
+cellchat <- mergeCellChat(cellchat_ls, add.names = names(cellchat_ls))
+
+rm(cellchat_pre)
+rm(cellchat_post)
+gc()
+```
+
+## Predict general principles of cell-cell communication
+
+Looking at total number of interactions and interactions strength.
+
+```{r}
+gg1 <- compareInteractions(cellchat, show.legend = F, group = c(1,2)) 
+gg2 <- compareInteractions(cellchat, show.legend = F, group = c(1,2), measure = "weight") 
+gg1 + gg2
+```
+
+The differential number of interactions or interaction strength in the cell-cell communication network between two datasets.
+
+```{r}
+par(mfrow = c(1,2), xpd=TRUE)
+netVisual_diffInteraction(cellchat, weight.scale = T, color.use = colours_comb, arrow.size = 0.5, arrow.width = 1.3)
+netVisual_diffInteraction(cellchat, weight.scale = T, measure = "weight", color.use = colours_comb, arrow.size = 0.5, arrow.width = 1.3)
+```
+
+Let's now have a look per cell type population as the signal source ...
+
+```{r}
+for(i in names(colours_comb)){
+  par(mfrow = c(1,2), xpd=TRUE)
+  netVisual_diffInteraction(cellchat, weight.scale = TRUE, color.use = colours_comb, sources.use = i, title.name = paste0("Differential number of interactions - ", i))
+  netVisual_diffInteraction(cellchat, weight.scale = TRUE, measure = "weight", color.use = colours_comb, sources.use = i, title.name = paste0("Differential interaction strength - ", i))
+}
+
+for(i in names(colours_comb)){
+  par(mfrow = c(1,2), xpd=TRUE)
+  netVisual_diffInteraction(cellchat, weight.scale = TRUE, color.use = colours_comb, targets.use = i, title.name = paste0("Differential number of interactions - ", i), color.edge = c("#E66100", "#0C7BDC"), arrow.size = 0.3)
+  netVisual_diffInteraction(cellchat, weight.scale = TRUE, measure = "weight", color.use = colours_comb, targets.use = i, title.name = paste0("Differential interaction strength - ", i), color.edge = c("#E66100", "#0C7BDC"), arrow.size = 0.3)
+}
+```
+
+```{r}
+gg1 <- netVisual_heatmap(cellchat, color.use=colours_comb)
+gg2 <- netVisual_heatmap(cellchat, measure = "weight", color.use=colours_comb)
+gg1 + gg2
+```
+
+```{r}
+weight.max <- getMaxWeight(cellchat_ls, attribute = c("idents","count"))
+par(mfrow = c(1,2), xpd=TRUE)
+for (i in 1:length(cellchat_ls)) {
+  netVisual_circle(cellchat_ls[[i]]@net$count, weight.scale = T, label.edge= F, edge.weight.max = weight.max[2], edge.width.max = 12, title.name = paste0("Number of interactions - ", names(cellchat_ls)[i]), color.use=colours_comb)
+}
+```
+
+```{r}
+# examine signaling sent from each cell group
+for (i in 1:length(cellchat_ls)) {
+  chosen <- cellchat_ls[[i]] 
+  mat <- chosen@net$weight 
+  
+  for (j in 1:nrow(mat)) {
+    mat2 <- matrix(0, nrow = nrow(mat), ncol = ncol(mat), dimnames = dimnames(mat))
+    mat2[j, ] <- mat[j, ] 
+    
+    title.name = paste(names(cellchat_ls)[i], "-", rownames(mat)[j])
+    
+    netVisual_circle(mat2, 
+                     vertex.weight = as.numeric(table(chosen@idents)), 
+                     weight.scale = TRUE, 
+                     edge.weight.max = max(mat), 
+                     title.name = title.name, 
+                     color.use = colours_comb)
+  }
+}
+```
+
+```{r}
+#Identify cell populations with significant changes in sending or receiving signals
+num.link <- sapply(cellchat_ls, function(x) {rowSums(x@net$count) + colSums(x@net$count)-diag(x@net$count)})
+weight.MinMax <- c(min(num.link), max(num.link)) 
+gg <- list()
+for (i in 1:length(cellchat_ls)) {
+  gg[[i]] <- netAnalysis_signalingRole_scatter(cellchat_ls[[i]], title = names(cellchat_ls)[i], weight.MinMax = weight.MinMax, color.use=colours_comb)
+}
+patchwork::wrap_plots(plots = gg)
+```
+
+```{r}
+gg1 <- netAnalysis_signalingChanges_scatter(cellchat, idents.use = "Neuron")
+gg2 <- netAnalysis_signalingChanges_scatter(cellchat, idents.use = "OPC-like")
+gg3 <- netAnalysis_signalingChanges_scatter(cellchat, idents.use = "AC-like")
+gg4 <- netAnalysis_signalingChanges_scatter(cellchat, idents.use = "Progenitor")
+gg1
+gg2
+gg3
+gg4
+```
+
+## Identify signaling groups based on their functional similarity
+
+Enriched pathways between conditions.
+
+* Weight Calculation:
+Sum of Probabilities: The function first computes the sum of probabilities across a certain dimension (presumably representing different network interactions) using apply(prob, 3, sum). This sum represents the total interaction strength for each interaction pair.
+Transformation: After summing, if the measure is "weight", the function attempts to transform these sums negatively scaled by the natural logarithm (-1/log(pSum)). This transformation could be a way to scale the contributions for better visualization or to meet specific analytical needs.
+Adjustment for Infinites and NAs: Post-transformation, the function checks for infinite or non-numeric values and adjusts them by assigning them scaled values within a specified range (seq(max(pSum)*1.1, max(pSum)*1.5, length.out = length(idx1))).
+
+* Pair-Wise Relative Contribution: The contribution of one group is divided by the contribution of a baseline or reference group (often the first group in the comparison), formatting the result to one decimal place.
+
+* paired Wilcoxon test is performed to determine whether there is a significant difference of the signaling information flow between two conditions (from probability scores extracted from NetP)
+
+```{r}
+gg1 <- rankNet(cellchat, mode = "comparison", stacked = T, do.stat = TRUE, color.use = colours_sample, font.size = 4)
+gg2 <- rankNet(cellchat, mode = "comparison", stacked = F, do.stat = TRUE, color.use = colours_sample, font.size = 4)
+gg1 + gg2
+```
+
+```{r}
+sig_paths <- as.data.frame(gg1$data)
+sig_paths <- sig_paths[sig_paths$pvalues <= 0.05, ]
+```
+
+```{r}
+# per cell type annotation (as source and target)
+for(i in names(colours_comb)){
+  gg1 <- rankNet(cellchat, mode = "comparison", stacked = T, do.stat = TRUE, color.use = colours_sample, font.size = 4, sources.use = i, title = paste0("Source - ",i))
+  print(gg1)
+}
+
+for(i in names(colours_comb)){
+  gg1 <- rankNet(cellchat, mode = "comparison", stacked = T, do.stat = TRUE, color.use = colours_sample, font.size = 4, targets.use = i, title = paste0("Target - ",i))
+  print(gg1)
+}
+```
+
+BMPER was significant in the Progenitor population in DEG analysis. BMP (related) also comes up as significant in the Progenitor population in CellChat ...
+
+## BMP
+
+```{r}
+pathways.show <- c("BMP") 
+weight.max <- getMaxWeight(cellchat_ls, slot.name = c("netP"), attribute = pathways.show) # control the edge weights across different datasets
+par(mfrow = c(1,2), xpd=TRUE)
+for (i in 1:length(cellchat_ls)) {
+  netVisual_aggregate(cellchat_ls[[i]], signaling = pathways.show, layout = "circle", edge.weight.max = weight.max[1], edge.width.max = 10, signaling.name = paste(pathways.show,
+                                                                                                                                                            names(cellchat_ls)[i]),
+                      color.use = colours_comb)
+}
+
+# pre- & post-treatment respectively 
+for(i in 1:length(cellchat_ls)){
+  plot <- netAnalysis_contribution(cellchat_ls[[i]], signaling = pathways.show)
+  print(plot)
+}
+```
+
+```{r}
+# extract significant interactions (pre- & post-treatment)
+for(i in 1:length(cellchat_ls)){
+  
+  pairLR.CypA <- extractEnrichedLR(cellchat_ls[[i]], signaling = pathways.show, geneLR.return = FALSE)
+  
+  for(j in 1:length(pairLR.CypA$interaction_name)){
+    
+  vertex.receiver = seq(1,4)
+  LR.show <- pairLR.CypA[j,]
+  netVisual_individual(cellchat_ls[[i]], signaling = pathways.show,  pairLR.use = LR.show, vertex.receiver = vertex.receiver, color.use = colours_comb)
+  
+  }
+  print(names(cellchat_ls[[i]]))
+}
+```
+
+## Compare outgoing (or incoming) signaling patterns associated with each cell population
+
+```{r}
+i=1
+pathway.union <- union(cellchat_ls[[i]]@netP$pathways, cellchat_ls[[i+1]]@netP$pathways)
+ht1 = netAnalysis_signalingRole_heatmap(cellchat_ls[[i]], pattern = "outgoing", signaling = pathway.union, title = names(cellchat_ls)[i], width = 5, height = 6, font.size = 3, color.use=colours_comb)
+ht2 = netAnalysis_signalingRole_heatmap(cellchat_ls[[i+1]], pattern = "outgoing", signaling = pathway.union, title = names(cellchat_ls)[i+1], width = 5, height = 6, color.use=colours_comb)
+draw(ht1 + ht2, ht_gap = unit(0.5, "cm"))
+ht1 = netAnalysis_signalingRole_heatmap(cellchat_ls[[i]], pattern = "incoming", signaling = pathway.union, title = names(cellchat_ls)[i], width = 5, height = 6, font.size = 3, color.heatmap = "GnBu", color.use = colours_comb)
+ht2 = netAnalysis_signalingRole_heatmap(cellchat_ls[[i+1]], pattern = "incoming", signaling = pathway.union, title = names(cellchat_ls)[i+1], width = 5, height = 6, color.heatmap = "GnBu", color.use = colours_comb)
+draw(ht1 + ht2, ht_gap = unit(0.5, "cm"))
+ht1 = netAnalysis_signalingRole_heatmap(cellchat_ls[[i]], pattern = "all", signaling = pathway.union, title = names(cellchat_ls)[i], width = 5, height = 6, font.size = 3, color.heatmap = "OrRd", color.use = colours_comb)
+ht2 = netAnalysis_signalingRole_heatmap(cellchat_ls[[i+1]], pattern = "all", signaling = pathway.union, title = names(cellchat_ls)[i+1], width = 5, height = 6, color.heatmap = "OrRd", color.use = colours_comb)
+draw(ht1 + ht2, ht_gap = unit(0.5, "cm"))
+```
+
+## Individual ligand-receptor pairs
+
+```{r}
+netVisual_bubble(cellchat, sources.use = 5, targets.use = c(1:9),  comparison = c(1, 2), angle.x = 45,
+                 color.text=colours_sample,  thresh = 0.0001, signaling=c("NECTIN"))
+
+netVisual_bubble(cellchat, sources.use = 5, targets.use = c(1:9),  comparison = c(1, 2), angle.x = 45,
+                 color.text=colours_sample,  thresh = 0.0001, signaling=c("SPP1"))
+```
+
+```{r}
+gg1 <- netVisual_bubble(cellchat, sources.use = 4, targets.use = c(1:9),  comparison = c(1, 2), max.dataset = 2, title.name = "Decreased signaling in Post-treatment", angle.x = 45, remove.isolate = T,  color.text=colours_sample)
+gg2 <- netVisual_bubble(cellchat, sources.use = 4, targets.use = c(1:9),  comparison = c(1, 2), max.dataset = 1, title.name = "Increased signaling in Post-treatment", angle.x = 45, remove.isolate = T,  color.text=colours_sample, font.size = 6)
+gg1
+gg2
+```
+
+## Compare the signaling gene expression distribution
+
+```{r}
+cellchat@meta$datasets = factor(cellchat@meta$datasets, levels = c("Pre-treatment", "Post-treatment"))
+plotGeneExpression(cellchat, signaling = "NOTCH", split.by = "datasets", colors.ggplot = T, type = "violin", color.use = colours_sample)
+
+plotGeneExpression(cellchat, signaling = "NECTIN", split.by = "datasets", colors.ggplot = T, type = "violin", color.use = colours_sample)
+```

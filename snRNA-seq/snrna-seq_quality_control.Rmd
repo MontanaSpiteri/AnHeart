@@ -1,0 +1,157 @@
+---
+title: "`r params$doc_title`"
+output: html_document
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+params:
+  doc_title: "QC & Pre-processing of snRNA-seq data""
+  Author: "Name"
+  sample:
+    label: "Sample Name"
+    input: text
+    value: A-01_Pre-treatment
+  mito:
+    label: "Mitochondrial Percent:"
+    input: checkbox
+    value: TRUE
+  doublet:
+    label: "Doublet Removal:"
+    input: checkbox
+    value: TRUE
+author: "`r params$Author`"
+---
+
+The following code (parameterised report) relates to the quality control and pre-processing of snRNA-seq data
+
+Processing sample:
+`r params$sample`
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+library(SingleCellExperiment)
+library(tidyverse)
+library(scuttle)
+library(scater)
+library(scran)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+library(mixtools)
+```
+
+```{r Load, include=FALSE}
+sce <- readRDS(file = paste0("/data/tmp/", params$sample, "_sce_raw.rds"))
+```
+
+# Data Quality Control
+
+## Doublet Removal
+
+Doublet removal was previously performed via Scrublet for this dataset:
+
+-   Doublet Threshold: `r max(sce$doublet_score[sce$predicted_doublets == FALSE])`
+-   There were `r sum(sce$predicted_doublets)` predicted doublets detected using this threshold
+-   Cells with a doublet score greater than this threshold will now be removed - if the threshold is greater than 0.25, then this will become the new threshold.
+
+`r max(sum(sce$predicted_doublets), sum(sce$doublet_score >=0.25))` doublets will be removed
+
+```{r}
+threshold = 0.25
+if( max(sce$doublet_score[sce$predicted_doublets == FALSE]) > 0.25){
+  sce <- sce[, sce$doublet_score < threshold]
+}
+
+sce <- sce[, !sce$predicted_doublets & colSums(counts(sce)) > 0]
+```
+
+#### Unfiltered Data Summary:
+
+-   The number of cells in the unfiltered data is `r ncol(sce)`
+-   The number of genes in the unfiltered data is `r nrow(sce)`
+
+```{r Quality Metrics, include=FALSE}
+if(params$mito == TRUE){
+  
+  # Mitochondrial Contamination
+  is.mito <- grep("^MT-", rownames(sce)) 
+  
+}
+
+# Ribosomal Contamination
+ribo_genes <- read.table("/data/meta/ribo_geneset.txt")
+is.ribo <- grep(ribo_genes$V1, rownames(sce)) 
+
+# Per-Cell Quality Control
+if(params$mito == FALSE){
+  sce_qc <- perCellQCMetrics(sce, subsets=list(Ribo=is.ribo))
+} else {
+  sce_qc <- perCellQCMetrics(sce, subsets=list(Mito=is.mito, Ribo=is.ribo))
+}
+
+colData(sce) <- cbind(colData(sce), sce_qc)
+sce_qc <- as.data.frame(sce_qc)
+sce_qc$sample <- sce$sample
+```
+
+```{r Outliers, include=FALSE}
+# Outliers
+outliers_mito <- isOutlier(sce_qc$subsets_Mito_percent, type="higher")
+outliers_sum <- isOutlier(sce_qc$sum, type="lower", log = T)
+outliers_detected <- isOutlier(sce_qc$detected, type="lower", log = T)
+```
+
+#### Outliers Summary:
+
+-   Mitochondrial Outliers (F/T): `r table(outliers_mito)`
+-   Detected Gene Outliers (F/T): `r table(outliers_detected)`
+-   Read Count Outliers (F/T): `r table(outliers_sum)`
+
+#### Filtration Thresholds:
+
+-   Mitochondrial threshold (upper/higher tail):
+
+```{r, echo=FALSE}
+attr(outliers_mito,"thresholds")
+```
+
+-   Detected genes threshold (lower tail):
+
+```{r, echo=FALSE}
+attr(outliers_detected,"thresholds")
+mad_detected <- 10^(median(log10(colSums(counts(sce)>0)))-3*mad(log10(colSums(counts(sce)>0))))
+mad_detected
+```
+
+-   Read count threshold (lower tail):
+
+```{r, echo=FALSE}
+attr(outliers_sum, "thresholds")
+mad_sum <- 10^(median(log10(colSums(counts(sce))))-3*mad(log10(colSums(counts(sce)))))
+mad_sum
+```
+
+```{r Filter, include=FALSE}
+# Filter
+sce <- sce[, colSums(counts(sce))>mad_sum & colSums(counts(sce)>0)>mad_detected & sce_qc$subsets_Mito_percent<10]
+```
+
+#### Filtered Data Summary:
+
+-   The number of cells retained after filtering is `r ncol(sce)`
+
+## QC Plots
+
+```{r Plot, echo=FALSE}
+# Plots
+if(!is.null(is.mito)){
+  ggplot(sce_qc, aes(x=sample, y=subsets_Mito_percent, color=sample)) + geom_violin() + labs(title="Mitochondrial Contamination",x="Sample", y = "% Mitochondria") + theme_classic() +geom_hline(yintercept = 10)
+}
+ggplot(sce_qc, aes(x=sample, y=subsets_Ribo_percent, color=sample)) + geom_violin() + labs(title="Ribosomal Contamination",x="Sample", y = "% Ribosome") + theme_classic() 
+ggplot(sce_qc, aes(x=sample, y=detected, color=sample)) + geom_violin() + labs(title="Detected Genes",x="Sample", y = "Detected Genes per cell") + theme_classic() 
+ggplot(sce_qc, aes(x=sample, y=sum, color=sample)) + geom_violin() + labs(title="Read Count",x="Sample", y = "Reads") + theme_classic()
+```
+
+## Output File
+
+```{r Save, include=TRUE}
+saveRDS(sce, file = paste0("/data/tmp/", params$sample, "_sce_filtered.rds"))
+```
