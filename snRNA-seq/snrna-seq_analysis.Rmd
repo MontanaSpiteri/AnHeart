@@ -1,0 +1,1377 @@
+---
+title: "Analysis of snRNA-seq data"
+output: html_document
+---
+
+The following code relates to the comparative analysis of processed/integrated snRNA-seq data from matche pre- and post-treatment participant samples.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(SummarizedExperiment)
+library(HDF5Array)
+library(SingleCellExperiment)
+library(intrinsicDimension)
+library(scater)
+library(scuttle)
+library(BiocParallel)
+library(SCENT)
+library(destiny)
+library(diptest)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(scran)
+library(limma)
+library(ggrepel)
+library(tidyverse)
+library(reshape2)
+library(BiocParallel)
+library(bluster)
+library(fgsea)
+library(pheatmap)
+library(lme4)
+library(edgeR)
+library(zoo)
+library(Seurat)
+library(GOSemSim)
+library(UpSetR)
+library(numbat)
+library(CytoTRACE2)
+library(entropy)
+library(reticulate)
+
+# Load colours 
+colours_comb <- c("#F28482", "#9D4EDD", "#6A994E", "#3A7CA5", "#EF233C",
+               "#F9C8C7", "#CDDEB9", "#A7C957", "#63A2C8", "#10F4B9", "#9CFDFF", "#000000", "#FFEA00", "#F4F3EE",
+               "#FAA307", "#FFBA08", "#FFD60A", "#E85D04", "#F48C06", "#F2CC8F",
+               "#656D4A", "#A4AC86", "#B6AD90", "#7F4F24", "#A68A64", "#D6D1C1",
+               "#000000", "#ADB5BD",
+               "#9D0208")
+names(colours_comb) <- c("AC-like", "MES-like", "OPC-like", "NPC-like", "Progenitor",
+                      "Astrocyte", "Oligodendrocyte", "OPC", "Neuron", "Excitatory Neuron", "Inhibitory Neuron", "Vasculature", "Immune", "Unknown",
+                      "T Cell", "NK Cell", "B Cell", "CD8 T Cell", "CD4 T Cell", "T Reg Cell", 
+                      "Dendritic Cell", "Neutrophil", "Monocyte", "Microglia", "Macrophage", "Mast Cell",
+                      "Endothelial", "Mural",
+                      "Death")
+
+colours_sample <- c("#0C7BDC", "#E66100")
+names(colours_sample) <- c("Pre-treatment", "Post-treatment")
+
+colours_malig <- c("#8c0001", "#ffabff")
+names(colours_malig) <- c("tumor", "normal")
+
+colours_genotype <- c('1' = '#ABC7E6', '2' = "#9596C9", '3' = "#9068AC", 
+                      '4' = "#413975", '5' = "#D3D3D3", '6' = "#ADD8E6",
+                      '7' = "#6D7B95", '8' = "#A091B8", "Unknown" = "#F4F3EE")
+
+colours <- c("A-01" = "#00FFFF",
+             "A-02" = "#6A5ACD",
+             "A-03" = "#008080",
+             "A-04" = "#228B22",
+             "A-05" = "#4B0082",
+             "A-06" = "#90EE90",
+             "A-07" = "#8F00FF",
+             "O-01" = "#FF2400",
+             "O-02" = "#FFD700",
+             "O-03" = "#FF7F50")
+
+colours_cc <- c("G1" = "#f8766d", "G2M" = "#16ba38", "S" = "#619cff")
+```
+
+# Load processed/integrated dataset
+
+```{r}
+sce_comb <- loadHDF5SummarizedExperiment("/data/process/", prefix="sce_integrated_") 
+```
+
+# Numbat CNVs
+
+Numbat CNV caller performed for both pre- & post-treatment together for each patient individually: `numbat_cnv.R`
+
+```{r}
+dir <- "/analysis/output/numbat_ouput/"
+
+sce_comb$Numbat_Class <- "Unknown"
+sce_comb$Numbat_Clone <- "Unknown"
+
+backup <- sce_comb
+for (i in unique(sce_comb$Patient)) {
+    sce_sub <- sce_comb[, sce_comb$Patient == i]
+
+    tryCatch({
+        nb <- Numbat$new(out_dir = paste0(dir, i))
+
+        pdf(paste0("figures/numbat_", i, ".pdf"))
+        p <- nb$plot_phylo_heatmap(clone_bar = TRUE, p_min = 0.9, clone_title = paste0(i, " - Genotype"))
+        print(p)
+        p <- nb$plot_consensus()
+        print(p)
+        p <- nb$bulk_clones %>% filter(n_cells > 50) %>% plot_bulks(min_LLR = 10, legend = TRUE, title = TRUE, title_size = 6)
+        print(p)
+        p <- nb$plot_mut_history()
+        print(p)
+        dev.off()
+
+        # Clonal assignments
+        clones <- nb$clone_post
+        clones <- clones[match(colnames(sce_sub), clones$cell), ]
+        sce_sub$Numbat_Class <- clones$compartment_opt
+        sce_sub$Numbat_Clone <- as.character(clones$clone_opt)
+    }, error = function(e) {
+        message(paste("Failed to load Numbat output for Patient", i, ": ", e$message))
+    })
+
+    sce_comb[, sce_comb$Patient == i] <- sce_sub
+}
+```
+
+```{r}
+df <- as.data.frame(reducedDim(sce_comb, "UMAP"))
+df$Numbat_Class <- sce_comb$Numbat_Class
+df$Numbat_Clone <- sce_comb$Numbat_Clone
+df$Patient <- sce_comb$Patient
+df$Sample_Type <- sce_comb$Sample_Type
+
+ggplot(df[sample(1:nrow(df)),], aes(x=UMAP1, y=UMAP2, color=Numbat_Class)) + geom_point(alpha=0.5) + 
+  theme_classic() + labs(title = "Malignant vs Normal")+
+guides(colour = guide_legend(override.aes = list(alpha = 1, size=3)))
+
+# including UNKNOWN cell population
+for(i in unique(df$Patient)){
+  plot <- df %>%
+    filter(Patient == i) %>%
+  dplyr::count(Numbat_Clone, Sample_Type) %>%
+  dplyr::group_by(Sample_Type) %>%
+  dplyr::mutate(pct = prop.table(n) * 100) %>%
+  ggplot(aes(x = Sample_Type, y = pct, fill = Numbat_Clone)) + 
+     labs(title = paste0(i)) +
+  geom_bar(stat = "identity") +
+  theme_classic() + scale_fill_manual(values=colours_genotype) 
+  print(plot)
+}
+```
+
+# Remove unknown celltype population
+
+Numbat results of 'Unknown' cell population mostly normal cells. This further validates it's removal from the dataset and subsequent analysis. 
+
+```{r}
+sce_comb <- sce_comb[, !sce_comb$annotation == "Unknown"]
+sce_comb$annotation <- factor(sce_comb$annotation)
+```
+
+167876 cells remain after removing Unknown
+
+```{r}
+# re-plot numbat results without 'Unknown' cell population
+df <- as.data.frame(reducedDim(sce_comb, "UMAP"))
+df$Numbat_Class <- sce_comb$Numbat_Class
+df$Numbat_Clone <- sce_comb$Numbat_Clone
+df$Patient <- sce_comb$Patient
+df$Sample_Type <- sce_comb$Sample_Type
+
+plot <- ggplot(df[sample(1:nrow(df)),], aes(x=UMAP1, y=UMAP2, color=Numbat_Class)) + geom_point(alpha=0.5) + 
+  theme_classic() + labs(title = "Malignant vs Normal")+
+guides(colour = guide_legend(override.aes = list(alpha = 1, size=3)))
+
+samp1 <- sample(1:nrow(df))
+plot <- ggplot(df[samp1,], aes(x=UMAP1[samp1], y=UMAP2[samp1])) + 
+      geom_point(col="black", size=0.9) +
+      geom_point(col="white", size=0.5) +
+      geom_point(aes(col=Numbat_Class[samp1]), size=0.455, alpha=0.75) + scale_color_manual(values=colours_malig) +theme_void() +
+      guides(colour = guide_legend(override.aes = list(alpha = 1, size=3)))
+
+# not including UNKNOWN cell population
+for(i in unique(df$Patient)){
+  plot <- df %>%
+    filter(Patient == i) %>%
+  dplyr::count(Numbat_Clone, Sample_Type) %>%
+  dplyr::group_by(Sample_Type) %>%
+  dplyr::mutate(pct = prop.table(n) * 100) %>%
+  ggplot(aes(x = Sample_Type, y = pct, fill = Numbat_Clone)) + 
+     labs(title = paste0(i)) +
+  geom_bar(stat = "identity") +
+  theme_classic() + scale_fill_manual(values=colours_genotype) 
+  print(plot)
+  
+  ggsave(filename = paste0("figures/clone_props_", i, ".svg"))
+}
+```
+
+# QC statistics
+
+```{r}
+mean_detected <- tapply(sce_comb$detected, sce_comb$sample, mean)
+median_detected <- tapply(sce_comb$detected, sce_comb$sample, median)
+mean_sum <- tapply(sce_comb$sum, sce_comb$sample, mean)
+
+mtx <- counts(sce_comb)
+total_genes_detected_per_sample <- function(sample_ids) {
+  sapply(unique(sample_ids), function(sample) {
+    sample_cells <- which(colData(sce_comb)$sample == sample)
+    sample_counts <- mtx[, sample_cells]
+    sum(rowSums(sample_counts) > 0)
+  })
+}
+total_genes_detected <- total_genes_detected_per_sample(sce_comb$sample)
+names(total_genes_detected) <- unique(sce_comb$sample)
+```
+
+# Cell type proportion barplot
+
+```{r}
+df <- as.data.frame(colData(sce_comb))
+
+df <- df %>%
+  dplyr::group_by(Patient, Sample_Type) %>%
+  dplyr::count(annotation) %>%
+  dplyr::mutate(Total = sum(n),  
+         Proportion = n / Total) %>%
+  dplyr::ungroup()
+
+df <- df %>%
+  mutate(Patient_Sample = factor(interaction(Patient, Sample_Type, sep = " - "),
+                                 levels = unique(interaction(Patient, Sample_Type, sep = " - ")),
+                                 ordered = TRUE))
+
+plot <- ggplot(df, aes(x = Patient_Sample, y = Proportion, fill = annotation)) +
+  geom_bar(stat = "identity", position = "stack") +  
+  labs(x = NULL, y = "Proportion of Total") +
+  theme_classic() +
+  scale_fill_manual(values = colours_comb) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+```
+
+# Remove participant 'A-04' due to low tumor purity
+
+```{r}
+sce_comb <- sce_comb[, !sce_comb$Patient == "A-04"]
+sce_comb$Patient <- factor(sce_comb$Patient)
+```
+
+158,487 cells remain
+
+# General integrated dataset figures
+
+```{r}
+df <- as.data.frame(reducedDim(sce_comb, "UMAP"))
+df$sample <- sce_comb$sample
+df$annotation <- sce_comb$annotation
+df$Patient <- sce_comb$Patient
+df$Sample_Type <- sce_comb$Sample_Type
+df$sum <- sce_comb$sum
+df$detected <- sce_comb$detected
+
+samp1 <- sample(1:nrow(df))
+themes <- theme_void()
+
+# cell type annotations
+plot <- ggplot(df[samp1,], aes(x=UMAP1[samp1], y=UMAP2[samp1])) + 
+      geom_point(col="black", size=0.9) +
+      geom_point(col="white", size=0.5) +
+      geom_point(aes(col=annotation[samp1]), size=0.455, alpha=0.75) +
+      scale_color_manual(values=colours_comb) + themes +
+      guides(colour = guide_legend(override.aes = list(alpha = 1, size=3)))
+
+# sample type
+plot <- ggplot(df[samp1,], aes(x=UMAP1[samp1], y=UMAP2[samp1])) + 
+      geom_point(col="black", size=0.9) +
+      geom_point(col="white", size=0.5) +
+      geom_point(aes(col=Sample_Type[samp1]), size=0.455, alpha=0.75) + themes +
+      scale_color_manual(values=colours_sample) + themes +
+      guides(colour = guide_legend(override.aes = list(alpha = 1, size=3)))
+
+# participant
+plot <- ggplot(df[samp1,], aes(x=UMAP1[samp1], y=UMAP2[samp1])) + 
+      geom_point(col="black", size=0.9) +
+      geom_point(col="white", size=0.5) +
+      geom_point(aes(col=Patient[samp1]), size=0.455, alpha=0.75) +
+      scale_color_manual(values=colours) + themes +
+      guides(colour = guide_legend(override.aes = list(alpha = 1, size=3)))
+
+# cell type annotation proportions
+plot_data <- df %>%
+  dplyr::count(annotation, Sample_Type) %>%
+  dplyr::group_by(Sample_Type) %>%
+  dplyr::mutate(proportion = prop.table(n))
+
+plot <- ggplot(plot_data, aes(x = Sample_Type, y = proportion, fill = annotation)) +
+  geom_bar(stat = "identity") +
+  theme_classic() +
+  theme(legend.key.size = unit(0.4, "cm"),
+        legend.text = element_text(size = 8),
+        axis.text = element_text(size = 8)) +
+  scale_fill_manual(values = colours_comb)
+
+## quality control plots
+# read count
+p <- ggplot(df, aes(x=UMAP1, y=UMAP2)) +
+      geom_point(col="black", size=0.9) +
+      geom_point(col="white", size=0.5) +
+      geom_point(aes(col=log10(sum)), size=0.455, alpha=0.75) +
+  theme_void() + scale_color_viridis_c()
+
+# detected genes
+p <- ggplot(df, aes(x=UMAP1, y=UMAP2)) +
+      geom_point(col="black", size=0.9) +
+      geom_point(col="white", size=0.5) +
+      geom_point(aes(col=log10(detected)), size=0.455, alpha=0.75) +
+  theme_void() + scale_color_viridis_c()
+```
+
+# Cell type annotation validation
+
+```{r}
+# canonical marker genes
+markers <- function(x, marker){
+  x$marker <- as.vector(logcounts(x[marker,]))
+  plot_data <- data.frame(UMAP1 = reducedDim(x, "UMAP")[,1],
+                          UMAP2 = reducedDim(x, "UMAP")[,2],
+                          Expression = x$marker)
+  plot_data <- plot_data[order(plot_data$Expression), ]
+  plot <- ggplot(plot_data, aes(x = UMAP1, y = UMAP2)) +
+    geom_point(col="black", size=0.9) +
+    geom_point(col="white", size=0.5) +
+    geom_point(aes(color = Expression), size=0.455, alpha=0.75) + 
+    theme(aspect.ratio = 1) + 
+    labs(color = marker) + 
+    scale_color_viridis_c() +
+      theme_void()
+  
+  #ggsave(filename = paste0("figures/", marker, "_expression.png"))
+  
+  return(plot)
+}
+
+genes <- c("MKI67", "TOP2A", "CENPA", "AQP4", "APOE", "MGAT4C", "SPARCL1", "OLIG1", "OLIG2", "DLL3", "SOX8")
+lapply(genes, function(marker) markers(sce_comb, marker))
+
+
+# Confusion matrix - all cell type annotations
+logcounts_comb <- as.matrix(logcounts(sce_sub)[genes, ])
+cell_types <- unique(sce_sub$annotation)
+
+# average logcounts for each cell type annotation
+avg_logcounts <- matrix(nrow = length(genes), ncol = length(cell_types), dimnames = list(genes, cell_types))
+for (i in cell_types) {
+    cells_of_type <- which(sce_sub$annotation == i)
+    avg_logcounts[, i] <- rowMeans(logcounts_comb[, cells_of_type], na.rm = TRUE)
+}
+
+p <- pheatmap(avg_logcounts, 
+         clustering_distance_rows = "euclidean",
+         clustering_distance_cols = "euclidean",
+         clustering_method = "complete",
+         scale = "row", 
+         color = colorRampPalette(c("blue", "white", "red"))(100), 
+         show_rownames = TRUE,
+         show_colnames = TRUE,
+         fontsize_row = 8,
+         angle_col = 45)
+```
+
+# Cell type proportional difference
+
+```{r}
+calculate_differences <- function(df) {
+  total_cells <- df %>%
+    dplyr::group_by(Patient, Sample_Type) %>%
+    dplyr::summarise(Total = n(), .groups = "drop") 
+  proportions_df <- df %>%
+    dplyr::group_by(Patient, annotation, Sample_Type) %>%
+    dplyr::tally() %>%
+    dplyr::left_join(total_cells, by = c("Patient", "Sample_Type")) %>%
+    dplyr::mutate(Proportion = n / Total) %>%
+    dplyr::select(-Total)
+  differences_df <- proportions_df %>%
+    dplyr::filter(Sample_Type == "Pre-treatment") %>%
+    dplyr::select(Patient, annotation, Pre_Proportion = Proportion) %>%
+    full_join(
+      proportions_df %>%
+        filter(Sample_Type == "Post-treatment") %>%
+        dplyr::select(Patient, annotation, Post_Proportion = Proportion),
+      by = c("Patient", "annotation")
+    ) %>%
+    replace_na(list(Pre_Proportion = 0, Post_Proportion = 0)) %>%
+    dplyr::mutate(Difference = Pre_Proportion - Post_Proportion) %>%
+    dplyr::select(Patient, annotation, Difference)
+  return(differences_df)
+}
+
+df1 <- df[grep("A-01", df$sample), ]
+df2 <- df[grep("A-02", df$sample), ]
+df3 <- df[grep("A-03", df$sample), ]
+df4 <- df[grep("A-05", df$sample), ]
+df5 <- df[grep("A-06", df$sample), ]
+df6 <- df[grep("A-07", df$sample), ]
+df7 <- df[grep("O-01", df$sample), ]
+df8 <- df[grep("O-02", df$sample), ]
+df9 <- df[grep("O-03", df$sample), ]
+diffs1 <- calculate_differences(df1) 
+diffs2 <- calculate_differences(df2)
+diffs3 <- calculate_differences(df3) 
+diffs4 <- calculate_differences(df4)
+diffs5 <- calculate_differences(df5)
+diffs6 <- calculate_differences(df6) 
+diffs7 <- calculate_differences(df7) 
+diffs8 <- calculate_differences(df8)
+diffs9 <- calculate_differences(df9)
+all_diffs <- bind_rows(diffs1, diffs2, diffs3, diffs4, diffs5, diffs6, diffs7, diffs8, diffs9)
+
+all_diffs <- all_diffs %>%
+  filter(!annotation %in% c("Vasculature"))
+
+existing_combinations <- unique(all_diffs[c("annotation", "Patient")])
+all_combinations <- expand.grid(annotation = unique(all_diffs$annotation),
+                                Patient = unique(all_diffs$Patient))
+missing_combinations <- anti_join(all_combinations, existing_combinations, by = c("annotation", "Patient"))
+missing_combinations$Difference <- 0
+all_diffs <- rbind(all_diffs, missing_combinations)
+all_diffs$annotation <- factor(all_diffs$annotation)
+all_diffs$Patient <- factor(all_diffs$Patient, levels=c("A-01", "A-02", "A-03", "A-05", "A-06", "A-07", "O-01", "O-02", "O-03"))
+
+plot <- ggplot(all_diffs, aes(x = annotation, y = Difference, fill = Patient)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.75), width = 0.75) +
+  scale_fill_manual(values = colours) +
+  coord_flip() +  
+  labs(x = "Annotation", y = "Proportional Difference", fill = "Patient") +
+  theme_classic() + scale_y_reverse() +
+  theme(legend.position = "bottom")
+```
+
+```{r}
+# tumour populations only
+sce_tum <- sce_comb[, sce_comb$annotation %in% c("AC-like", "OPC-like", "Progenitor")]
+sce_tum$annotation <- factor(sce_tum$annotation)
+
+df <- as.data.frame(reducedDim(sce_tum, "UMAP"))
+df$sample <- sce_tum$sample
+df$annotation <- sce_tum$annotation
+df$Patient <- sce_tum$Patient
+df$Sample_Type <- sce_tum$Sample_Type
+df1 <- df[grep("A-01", df$sample), ]
+df2 <- df[grep("A-02", df$sample), ]
+df3 <- df[grep("A-03", df$sample), ]
+df4 <- df[grep("A-05", df$sample), ]
+df5 <- df[grep("A-06", df$sample), ]
+df6 <- df[grep("A-07", df$sample), ]
+df7 <- df[grep("O-01", df$sample), ]
+df8 <- df[grep("O-02", df$sample), ]
+df9 <- df[grep("O-03", df$sample), ]
+diffs1 <- calculate_differences(df1) 
+diffs2 <- calculate_differences(df2)
+diffs3 <- calculate_differences(df3) 
+diffs4 <- calculate_differences(df4)
+diffs5 <- calculate_differences(df5)
+diffs6 <- calculate_differences(df6) 
+diffs7 <- calculate_differences(df7) 
+diffs8 <- calculate_differences(df8)
+diffs9 <- calculate_differences(df9)
+all_diffs <- bind_rows(diffs1, diffs2, diffs3, diffs4, diffs5, diffs6, diffs7, diffs8, diffs9)
+
+existing_combinations <- unique(all_diffs[c("annotation", "Patient")])
+all_combinations <- expand.grid(annotation = unique(all_diffs$annotation),
+                                Patient = unique(all_diffs$Patient))
+missing_combinations <- anti_join(all_combinations, existing_combinations, by = c("annotation", "Patient"))
+all_diffs <- rbind(all_diffs, missing_combinations)
+all_diffs$annotation <- factor(all_diffs$annotation)
+all_diffs$Patient <- factor(all_diffs$Patient, levels=c("A-01", "A-02", "A-03", "A-05", "A-06", "A-07", "O-01", "O-02", "O-03"))
+
+plot <- ggplot(all_diffs, aes(x = annotation, y = Difference, fill = Patient)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.75), width = 0.75) +
+  scale_fill_manual(values = colours) +
+  coord_flip() +  
+  labs(x = "Annotation", y = "Proportional Difference", fill = "Patient") +
+  theme_classic() + scale_y_reverse() +
+  theme(legend.position = "bottom")
+```
+
+# Immune cell type annotation
+
+Re-cluster and annotate Immune cell cluster
+
+```{r}
+sce_immune <- sce_comb[, sce_comb$annotation == "Immune"]
+df_immune <- as.data.frame(reducedDim(sce_immune, "UMAP"))
+
+## T Cell
+genes <- c("CD4", "IL10", "CD8A", "CD3E", "CCR7", "CD27", "IRF4", "CD44", "PTPRC", "CD28", "LAG3", "CD38", "KLRB1", "CD69", "TIGIT", "FOXP3", "GATA3", "IL7R", "TRAC")
+lapply(genes, function(x){
+    markers(sce_immune, marker = x)
+})
+## B-cells
+genes <- c("CD19", "CD79A", "BANK1")
+lapply(genes, function(x){
+    markers(sce_immune, marker = x)
+})
+## Macrophage
+genes <- c("AHR", "CD163", "CD74", "HLA-DRB1", "CD68")
+lapply(genes, function(x){
+    markers(sce_immune, marker = x)
+})
+## Microglia
+genes <- c("P2RY12", "CX3CR1", "C1QC", "SPP1", "TMEM119")
+lapply(genes, function(x){
+    markers(sce_immune, marker = x)
+})
+## Neutrophil
+genes <- c("ITGAX", "SLC11A1", "CXCR1")
+lapply(genes, function(x){
+    markers(sce_immune, marker = x)
+})
+## Monocyte
+genes <- c("VCAN", "FCER1G", "CD14")
+lapply(genes, function(x){
+    markers(sce_immune, marker = x)
+})
+## Dendritic Cell
+genes <- c("FCER1A", "PLAC8", "S100A4", "CASP8", "HLA-DQA1", "HLA-DQB1")
+lapply(genes, function(x){
+    markers(sce_immune, marker = x)
+})
+## NK Cell
+genes <- c("CD160", "CD244", "KLRF1", "KLRC1", "GNLY", "IL18RAP", "XCL2", "PRF1")
+lapply(genes, function(x){
+    markers(sce_immune, marker = x)
+})
+## Reactive microglia
+genes <- c("CD68", "CX3CR1", "TLR4", "CLEC7A", "TSPO")
+lapply(genes, function(x){
+    markers(sce_immune, marker = x)
+})
+```
+
+```{r}
+# re-cluster immune population
+set.seed(0010101010)
+Clusters <- scran::clusterCells(sce_immune, use.dimred="X_scVI", 
+                                BLUSPARAM=SNNGraphParam(k=40, type="rank", cluster.fun="leiden"))
+table(Clusters)
+
+sce_immune$Cluster <- Clusters
+df_immune$Cluster <- sce_immune$Cluster
+df_immune$sample <- sce_immune$sample
+df_immune$Sample_Type <- sce_immune$Sample_Type
+
+colours_clusters <- Polychrome::palette36.colors(12)
+names(colours_clusters) <- 1:12
+
+ggplot(df_immune[sample(1:nrow(df_immune)),], aes(x=UMAP1, y=UMAP2, color=Cluster)) + geom_point(alpha=0.5) + 
+  theme_classic() +
+guides(colour = guide_legend(override.aes = list(alpha = 1, size=3))) + scale_color_manual(values=colours_clusters) 
+
+# assign immune annotations
+annotations <- read.csv(file = "/data/process/annotations_immune.csv")
+sce_immune$annotation <- annotations$annotation[match(sce_immune$Cluster, annotations$cluster)]
+sce_immune$annotation <- factor(sce_immune$annotation)
+df_immune$annotation <- sce_immune$annotation
+
+ggplot(df_immune[sample(1:nrow(df_immune)),], aes(x=UMAP1, y=UMAP2, color=annotation)) + geom_point(alpha=0.5) + 
+  theme_classic() + 
+guides(colour = guide_legend(override.aes = list(alpha = 1, size=3))) + scale_color_manual(values=colours_comb) 
+```
+
+```{r}
+# immune cell type annotation proportional difference
+df_immune <- df_immune[!is.na(df_immune$annotation), ]
+
+df1 <- df_immune[grep("A-01", df_immune$sample), ]
+df2 <- df_immune[grep("A-02", df_immune$sample), ]
+df3 <- df_immune[grep("A-03", df_immune$sample), ]
+df4 <- df_immune[grep("A-05", df_immune$sample), ]
+df5 <- df_immune[grep("A-06", df_immune$sample), ]
+df6 <- df_immune[grep("A-07", df_immune$sample), ]
+df7 <- df_immune[grep("O-01", df_immune$sample), ]
+df8 <- df_immune[grep("O-02", df_immune$sample), ]
+df9 <- df_immune[grep("O-03", df_immune$sample), ]
+diffs1 <- calculate_differences(df1) 
+diffs2 <- calculate_differences(df2)
+diffs3 <- calculate_differences(df3) 
+diffs4 <- calculate_differences(df4)
+diffs5 <- calculate_differences(df5)
+diffs6 <- calculate_differences(df6) 
+diffs7 <- calculate_differences(df7) 
+diffs8 <- calculate_differences(df8)
+diffs9 <- calculate_differences(df9)
+all_diffs <- bind_rows(diffs1, diffs2, diffs3, diffs4, diffs5, diffs6, diffs7, diffs8, diffs9)
+
+existing_combinations <- unique(all_diffs[c("annotation", "Patient")])
+all_combinations <- expand.grid(annotation = unique(all_diffs$annotation),
+                                Patient = unique(all_diffs$Patient))
+missing_combinations <- anti_join(all_combinations, existing_combinations, by = c("annotation", "Patient"))
+missing_combinations$Difference <- 0
+all_diffs <- rbind(all_diffs, missing_combinations)
+all_diffs$annotation <- factor(all_diffs$annotation)
+all_diffs$Patient <- factor(all_diffs$Patient, levels=c("A-01", "A-02", "A-03", "A-05", "A-06", "A-07", "O-01", "O-02", "O-03"))
+
+p <- ggplot(all_diffs, aes(x = annotation, y = Difference, fill = Patient)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.75), width = 0.75) +
+  scale_fill_manual(values = colours) +
+  coord_flip() +  
+  labs(x = "Immune Annotation", y = "Proportional Difference", fill = "Patient") +
+  theme_classic() + scale_y_reverse() +
+  theme(legend.position = "bottom")
+```
+
+```{r}
+# confusion matrix - Immune cell type annotation validatuon
+genes <- read_xlsx("/public_datasets/deconvolution_signatures/immune_signatures.xlsx")
+genes <- genes[genes$Population %in% c("Macrophage", "Microglia", "T Cell"), ]
+genes <- as.character(unique(genes$Gene))
+
+df_immune <- cbind(df_immune, t(as.matrix(logcounts(sce_immune[genes, ]))))
+logcounts_immune <- as.matrix(logcounts(sce_immune)[genes, ])
+cell_types <- unique(sce_immune$annotation)
+
+# average logcounts (immune gene modules) for each annotation
+avg_logcounts <- matrix(nrow = length(genes), ncol = length(cell_types), dimnames = list(genes, cell_types))
+for (i in cell_types) {
+    cells_of_type <- which(sce_immune$annotation == i)
+    avg_logcounts[, i] <- rowMeans(logcounts_immune[, cells_of_type], na.rm = TRUE)
+}
+
+p <- pheatmap(avg_logcounts, 
+         clustering_distance_rows = "euclidean",
+         clustering_distance_cols = "euclidean",
+         clustering_method = "complete",
+         scale = "row", 
+         color = colorRampPalette(c("blue", "white", "red"))(100), 
+         show_rownames = TRUE,
+         show_colnames = TRUE,
+         fontsize_row = 8,
+         angle_col = 45)
+```
+
+# CellCycle analysis
+
+```{r}
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+seurat_cellcycle <- sce_comb
+counts(seurat_cellcycle) <- as.matrix(counts(seurat_cellcycle))
+logcounts(seurat_cellcycle) <- as.matrix(logcounts(seurat_cellcycle))
+seurat_cellcycle <- as.Seurat(seurat_cellcycle) 
+
+seurat_cellcycle <- CellCycleScoring(seurat_cellcycle, s.features = s.genes, g2m.features = g2m.genes)
+head(seurat_cellcycle)
+
+res <- data.frame(S.Score=seurat_cellcycle$S.Score,
+                  G2M.Score=seurat_cellcycle$G2M.Score,
+                  Phase=seurat_cellcycle$Phase)
+rownames(res) <- colnames(seurat_cellcycle)
+
+sce_sub <- sce_comb
+sce_sub <- sce_sub[, !duplicated(colnames(sce_sub))]
+
+df_cc <- as.data.frame(reducedDim(sce_sub, "UMAP"))
+res <- res[res$X %in% rownames(df_cc), ]
+df_cc <- cbind(df_cc, res)
+df_cc$annotation <- sce_sub$annotation
+df_cc$Sample_Type <- sce_sub$Sample_Type
+
+samp1 <- sample(1:nrow(df_cc))
+plot <- ggplot(df_cc[samp1,], aes(x=UMAP1[samp1], y=UMAP2[samp1])) + 
+      geom_point(col="black", size=0.9) +
+      geom_point(col="white", size=0.5) +
+      geom_point(aes(col=Phase[samp1]), size=0.455, alpha=0.75) +theme_void() +
+      guides(colour = guide_legend(override.aes = list(alpha = 1, size=3)))
+
+df_summary <- df_cc %>%
+  group_by(Sample_Type, annotation, Phase) %>%
+  summarise(Count = n(), .groups = 'drop') %>%
+  group_by(Sample_Type, annotation) %>%
+  mutate(Proportion = Count / sum(Count))
+
+for(i in unique(df_summary$annotation)){
+  anno_data <- filter(df_summary, annotation == i)
+  p <- ggplot(anno_data, aes(x = 2, y = Proportion, fill = Phase)) +
+    geom_bar(stat = "identity", width = 1) +
+    coord_polar(theta = "y") +
+    facet_wrap(~Sample_Type) +
+    xlim(0.5, 2.5) +
+    theme_void() +
+    labs(title = paste(i),
+         fill = "Phase") +
+    scale_fill_manual(values = colours_cc)
+  print(p)
+  
+  #ggsave(paste0("figures/cellcycle_", i, ".png"))
+}
+
+rm(seurat_cellcycle, df_cc)
+```
+
+# CytoTRACE2 differentiation potency analysis
+
+"potency score" - continuous value ranging from 0 (differentiated) to 1 (stem cells capable of generating an entire multicellular organism).
+
+```{r}
+# tumor cells only
+# remove duplicates
+sce_tum <- sce_tum[, !duplicated(colnames(sce_tum))]
+sce_tum <- sce_tum[!duplicated(rownames(sce_tum)), ]
+
+mat <- as.matrix(logcounts(sce_tum))
+mat <- as.data.frame(mat)
+results <- cytotrace2(mat, species = "human", ncores = 8, batch_size = NULL, smooth_batch_size = NULL)
+
+sce_tum <- sce_tum[, !duplicated(colnames(sce_tum))]
+sce_tum <- sce_tum[!duplicated(rownames(sce_tum)), ]
+sce_tum <- sce_tum[, colnames(sce_tum) %in% results$...1]
+sce_tum$potency_score <- results$CytoTRACE2_Relative
+sce_tum$potency_class <- results$preKNN_CytoTRACE2_Potency
+
+df_cyto <- as.data.frame(reducedDim(sce_tum, "UMAP"))
+df_cyto$annotation <- sce_tum$annotation
+df_cyto$Sample_Type <- sce_tum$Sample_Type
+df_cyto$Patient <- sce_tum$Patient
+df_cyto$potency_score <- sce_tum$potency_score
+df_cyto$potency_class <- sce_tum$potency_class
+
+colours_tum <- c("AC-like"="#F28482", "OPC-like"="#6A994E", "Progenitor"="#EF233C")
+
+samp1 <- sample(1:nrow(df_cyto))
+plot <- ggplot(df_cyto[samp1,], aes(x=UMAP1, y=UMAP2)) +
+      geom_point(col="black", size=0.9) +
+      geom_point(col="white", size=0.5) +
+      geom_point(aes(col=potency_score), size=0.455, alpha=0.75) + 
+      labs(color = "Potency Score") + 
+      theme_void() + scale_color_viridis_c(option = "B")
+
+df_prog <- df_cyto[df_cyto$annotation == "Progenitor", ]
+# density
+df_sub <- df_prog %>% filter(Sample_Type == "Surgery")
+summary_stats <- df_sub %>%
+  summarise(
+    Mean = mean(potency_score, na.rm = TRUE),
+    Median = median(potency_score, na.rm = TRUE),
+    Standard_Deviation = sd(potency_score, na.rm = TRUE),
+    Skewness = e1071::skewness(potency_score, na.rm = TRUE),
+    Kurtosis = e1071::kurtosis(potency_score, na.rm = TRUE)
+  )
+
+plot <- ggplot(df_prog, aes(x = potency_score)) +
+  geom_density(aes(y = ..density..), fill = "#EF233C") +  
+  geom_density(color = "#EF233C") +  
+  facet_wrap(~Sample_Type) +
+  labs(x = "Potency Score", y = "Density") +  
+  theme_classic()
+
+df_cyto$Interaction <- with(df_cyto, interaction(annotation, Sample_Type, sep = " - "))
+df_cyto$Interaction <- factor(df_cyto$Interaction, levels = unique(df_cyto$Interaction[order(df_cyto$annotation, df_cyto$Sample_Type)]))
+
+p <- ggplot(df_cyto, aes(x = Interaction, y = potency_score, fill = Sample_Type)) +
+  geom_boxplot() +
+  geom_jitter(data = df_cyto[samp1, ], aes(color = Patient), width = 0.2, size = 0.8, alpha = 0.5) +
+  labs(x = NULL, y = "Potency Score") +
+  theme_classic() +
+  scale_fill_manual(values = colours_sample) +
+  scale_color_manual(values = colours) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# boxplot significance (t test)
+t_test <- df_cyto %>%
+  split(.$Sample_Type) %>%
+  map_df(.f = function(data_sample) {
+    pairwise_result <- pairwise.t.test(data_sample$potency_score, data_sample$annotation,
+                                       p.adjust.method = "bonferroni")
+    tidy(pairwise_result) %>%
+      mutate(Sample_Type = unique(data_sample$Sample_Type))
+  })
+```
+
+# Butterfly meta-module entropy
+
+Meta-module scores and plots via `metamodule_plots.R`
+
+```{r}
+sc_pre <- read.csv("output/metamodule/metamodule_assignments_progenitor_pre.csv")
+sc_post <- read.csv("output/metamodule/metamodule_assignments_progenitor_post.csv")
+
+calculate_entropy <- function(scores) {
+  prop <- table(scores) / length(scores)
+  entropy(prop, unit = "log2")
+}
+
+entr_pre <- calculate_entropy(sc_pre$meta_module)
+entr_post <- calculate_entropy(sc_post$meta_module)
+
+combined_meta_modules <- c(sc_pre$meta_module, sc_post$meta_module)
+n_pre <- length(sc_pre$meta_module)
+n_post <- length(sc_post$meta_module)
+
+# Perform permutation test
+n_permutations <- 1000  
+diff_entropy_perm <- numeric(n_permutations)
+
+set.seed(1010010)
+for (i in 1:n_permutations) {
+  permuted_labels <- sample(rep(1:2, c(n_pre, n_post)))
+  
+  entropy_perm1 <- calculate_entropy(combined_meta_modules[permuted_labels == 1])
+  entropy_perm2 <- calculate_entropy(combined_meta_modules[permuted_labels == 2])
+  
+  diff_entropy_perm[i] <- entropy_perm2 - entropy_perm1
+}
+
+# Observed difference (Post-treatment - Pre-treatment)
+obs_diff_entropy <- entr_post - entr_pre
+p_value <- sum(diff_entropy_perm >= obs_diff_entropy) / n_permutations
+```
+
+# Prepare snRNA-seq data for CytoSPACE integration with relevant spatial transcriptomics data
+
+```{r}
+spatial_samps <- c("O-01_pre-treatment", "O-01_post-treatment", "A-03_pre-treatment", "A-03_post-treatment", "A-05_pre-treatment", "A-05_post-treatment")
+
+for(i in unique(spatial_samps)){
+  sce_spatial <- sce_comb[, sce_comb$Sample == i]
+  patient <- unique(sce_spatial$Patient_ID)
+  sample_type <- unique(sce_spatial$Sample_Type)
+
+  data <- as.matrix(counts(sce_spatial))
+  data <- as.data.frame(cbind(GENES=rownames(data), data))
+  write.table(data, file = paste0("/data/process/cytospace/", patient, "_", sample_type, "_scrna_counts.txt"), row.names = FALSE, col.names = TRUE, quote = FALSE, sep = "\t")
+  
+  annos <- data.frame(Cell_IDs=colnames(sce_spatial),
+                    CellType=sce_spatial$annotation)
+  write.table(annos, file = paste0("/data/process/cytospace/", patient, "_", sample_type, "_scrna_annos.txt"), row.names = FALSE, col.names = TRUE, quote = FALSE, sep = "\t")
+}
+
+rm(sce_spatial, data, annos)
+gc()
+```
+
+# Differential abundance
+
+```{r}
+sce_comb$Sample <- factor(sce_comb$Sample)
+abundances <- table(sce_comb$annotation, sce_comb$Sample) 
+abundances <- unclass(abundances) 
+head(abundances)
+
+extra.info <- colData(sce_comb)[match(colnames(abundances), sce_comb$Sample),]
+y.ab <- DGEList(abundances, samples=extra.info)
+y.ab
+
+keep <- filterByExpr(y.ab, group=y.ab$samples$Sample_Type)
+y.ab <- y.ab[keep,]
+summary(keep)
+# OPC cell population removed (small number)
+
+design <- model.matrix(~factor(Sample_Type) + factor(Patient), y.ab$samples)
+y.ab <- estimateDisp(y.ab, design, trend="none")
+summary(y.ab$common.dispersion)
+
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+summary(fit.ab$var.prior)
+
+res <- glmQLFTest(fit.ab, coef=2)
+summary(decideTests(res))
+
+topTags(res)
+```
+No significant
+
+# GSEA Per Annotation using Spitzer et al. 2024 method
+
+```{r}
+# gene sets of interest for GSEA
+pathways.hallmark <- gmtPathways("/public_datasets/msigdb/h.all.v2023.2.Hs.symbols.gmt.txt")
+pathways.go <- gmtPathways("/public_datasets/msigdb/c5.go.v2023.2.Hs.symbols.gmt.txt")
+pathways.glioma <- read.csv("/public_datasets/deconvolution_signatures/glioma_modules.csv", header=F)
+pathways.glioma <- pathways.glioma[, -2]
+pathways.glioma <- setNames(
+  lapply(seq_len(nrow(pathways.glioma)), function(i) {
+    genes <- as.character(unlist(pathways.glioma[i, -1]))
+    genes <- genes[genes != ""]
+    return(genes)
+  }),
+  pathways.glioma[, 1]
+)
+gene_sets <- c(pathways.hallmark, pathways.go, pathways.glioma)
+```
+
+```{r}
+sample_info <- data.frame(colData(sce_comb))
+
+# Remove OPC cell population as only few patients have OPC cells
+sample_info <- sample_info[!sample_info$annotation == "OPC", ]
+sample_info$annotation <- factor(sample_info$annotation)
+
+# aggregate to bulk for each sample type by patient
+aggregate_to_bulk <- function(sample_indices) {
+  rowMeans(logcounts(sce_comb)[, sample_indices])
+}
+
+# GSEA all cell populations
+# Uncomment fo tumor cell populations only
+#sample_info <- sample_info[sample_info$annotation %in% c("AC-like", "OPC-like", "Progenitor"), ]
+#sample_info$annotation <- factor(sample_info$annotation)
+
+gsea <- function(sample_info, gene_sets) {
+  bulk_expression <- lapply(unique(sample_info$Patient), function(patient_id) {
+    patient_data <- sample_info[sample_info$Patient == patient_id, ]
+    
+    pre_bulk <- aggregate_to_bulk(which(patient_data$Sample_Type == "Pre-treatment"))
+    post_bulk <- aggregate_to_bulk(which(patient_data$Sample_Type == "Post-treatment"))
+    
+    list(Pre = pre_bulk, Post = post_bulk)
+  })
+  
+  avg_expr_pre <- rowMeans(do.call(cbind, lapply(bulk_expression, function(x) x$Pre)), na.rm = TRUE)
+  avg_expr_post <- rowMeans(do.call(cbind, lapply(bulk_expression, function(x) x$Post)), na.rm = TRUE)
+  
+  log_ratios <- avg_expr_post - avg_expr_pre
+  ranked_genes <- sort(log_ratios, decreasing = TRUE, index.return = TRUE)$x
+  
+  return(list(
+    GSEA_Results = fgsea(pathways = gene_sets, stats = ranked_genes),
+    Log_Ratios = log_ratios,
+    Ranked_Genes = ranked_genes
+  ))
+}
+gsea_results <- gsea(sample_info, gene_sets)
+
+# significant pathways ordered by NES
+gsea_clean <- gsea_results$GSEA_Results %>%
+    filter(padj < 0.05) %>%
+    arrange(desc(NES)) %>%
+    select(-leadingEdge, -ES)
+
+# volcano
+gsea <- as.data.frame(gsea_results$GSEA_Results)
+gsea <- na.omit(gsea)
+plot <- ggplot(gsea, aes(x = NES, y = -log10(padj), color = pathway)) +
+  geom_point(size = 5) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  labs(x = "Normalised Enrichment Score (NES)", y = "-log10(adjusted p-value)", title = "ALL") +
+  geom_text_repel(data = gsea %>% filter(NES > 0) %>% slice_max(order_by = -log10(padj), n = 9),
+                  aes(label = pathway), color = "black", size = 1.5) +
+  geom_text_repel(data = gsea %>% filter(NES < 0) %>% slice_max(order_by = -log10(padj), n = 9),
+                  aes(label = pathway), color = "black", size = 1.5) +
+  geom_point(data = gsea %>% filter(pathway %in% c("AC-like", "Astrocyte", "G1S", "G2M", "MES-like", "NPC-like", "Oligodendrocyte", "OPC", "OPC-like")),
+             aes(x = NES, y = -log10(padj)), size = 9) +
+  scale_color_manual(values = c("AC-like" = "#F28482", "G1S" = "blue", "G2M" = "green", "OPC-like" = "#6A994E", 
+                                "NPC-like" = "#3A7CA5", "MES-like" = "#9D4EDD", "Astrocyte" = "#F9C8C7", 
+                                "Oligodendrocyte" = "#CDDEB9", "OPC" = "#A7C957"),
+                     na.value = "lightgrey") +
+  theme_classic() + 
+  theme(legend.position = "right")
+print(plot)
+```
+
+# DEG Analysis
+
+## Pre- vs Post-treatment
+
+i.e. for each annotation, are there any DEGs between pre- and post-treatment samples accounting for Patient variable
+
+```{r}
+# remove genes expressed in <1% of cells to reduce noise in dataset
+sce_comb <- sce_comb[rowSums(counts(sce_comb) > 0) >= ceiling(ncol(sce_comb) * 0.01), ]
+
+summed_sce <- aggregateAcrossCells(sce_comb, 
+    ids=DataFrame(sample=sce_comb$sample,
+        Status= sce_comb$Sample_Type,
+        Patient= sce_comb$Patient,
+        Annotation=sce_comb$annotation
+        )
+)
+summed_sce  <- summed_sce[ ,summed_sce$ncells  >= 10]
+
+# per annotation
+de_results <- pseudoBulkDGE(summed_sce, 
+    label=summed_sce$Annotation,
+    design= ~ Status + Patient,
+    coef="StatusPost-treatment",
+) 
+metadata(de_results)$failed 
+
+is.de <- decideTestsPerLabel(de_results, threshold=0.05)
+summarizeTestsPerLabel(is.de)
+
+entrez.ids <- mapIds(org.Hs.eg.db, keys=rownames(sce_comb), 
+    column="ENTREZID", keytype="SYMBOL")
+
+go.output <- list()
+anno.output <- list()
+for(i in names(de_results)){
+  
+  chosen <- de_results[[i]]
+  chosen <- chosen[!is.na(chosen$logFC),]
+  anno.output[[i]] <- chosen
+  
+  order <- chosen[order(chosen$PValue), ]
+  write.csv(order, file=
+    paste0("output/deg_genefilt_annotation_", i, ".csv"))
+  
+  ordered <- rownames(chosen[chosen$FDR<0.05, ])
+  go.out <- limma::goana(unique(entrez.ids[ordered]), species="Hs", 
+    universe=unique(entrez.ids))
+  
+  # Only keeping biological process terms that are not overly general.
+  go.out <- go.out[order(go.out$P.DE),]
+  go_treat <- go.out[go.out$Ont=="BP" & go.out$N <= 200,]
+  go.output[[i]] <- go_treat
+
+}
+```
+
+# GSEA Per Annotation from DEG ranked lists
+
+```{r}
+ranked_list <- list()
+for (i in names(de_results)) {
+  
+  de_sub <- de_results[[i]] 
+  
+  pvals <- de_sub$PValue
+  logFC <- de_sub$logFC
+  signed_pvals <- sign(logFC) * -log10(pvals)
+  
+  ranked_genes_signed_pvals <- setNames(signed_pvals, rownames(de_sub))
+  ranked_genes_signed_pvals <- sort(ranked_genes_signed_pvals, decreasing = TRUE)
+  
+  ranked_list[[i]] <- ranked_genes_signed_pvals
+  
+}
+
+set.seed(1010010)
+gsea_results <- list()
+for (i in names(ranked_list)) {
+  
+  ranked_genes <- ranked_list[[i]]
+  
+  fgsea_res <- fgsea(
+    pathways = gene_sets,         
+    stats = ranked_genes,          
+  )
+  
+  gsea_results[[i]] <- fgsea_res
+}
+
+for (i in names(gsea_results)) {
+  gsea <- gsea_results[[i]]
+  
+  # significant pathways ordered by NES
+  gsea_clean <- gsea %>%
+    filter(padj < 0.05) %>%
+    arrange(desc(NES)) %>%
+    select(-leadingEdge, -ES)
+
+  #write.csv(gsea_clean, file = paste0("output/gsea_results_", i, ".csv"))
+}
+
+# gsea volcano plot
+for(i in names(gsea_results)){
+  gsea <- gsea_results[[i]]
+
+  plot <- ggplot(gsea, aes(x = NES, y = -log10(padj), color = pathway)) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  labs(x = "Normalised Enrichment Score (NES)", y = "-log10 adjusted p-value", title = i) +
+  geom_text_repel(data = gsea %>% filter(NES > 0) %>% slice_max(order_by = -log10(padj), n = 18),
+                  aes(label = pathway), color = "black", size = 1.5) +
+  geom_text_repel(data = gsea %>% filter(NES < 0) %>% slice_max(order_by = -log10(padj), n = 18),
+                  aes(label = pathway), color = "black", size = 1.5) +
+  geom_point(data = gsea %>% filter(pathway %in% c("AC-like", "Astrocyte", "G1S", "G2M", "MES-like", "NPC-like", "Oligodendrocyte", "OPC", "OPC-like")),
+             aes(x = NES, y = -log10(padj)), size = 5) +
+  scale_color_manual(values = c("AC-like" = "#F28482", "G1S" = "blue", "G2M" = "green", "OPC-like" = "#6A994E", 
+                                "NPC-like" = "#3A7CA5", "MES-like" = "#9D4EDD", "Astrocyte" = "#F9C8C7", 
+                                "Oligodendrocyte" = "#CDDEB9", "OPC" = "#A7C957"),
+                     na.value = "lightgrey") +
+  theme_classic() + 
+  theme(legend.position = "right")
+  print(plot)
+  
+  ggsave(filename = paste0("figures/gsea_volcano_", i, ".svg"), plot = plot)
+  
+}
+
+# GSEA for all tumor cell populations combined
+summed_sce <- summed_sce[, summed_sce$annotation %in% c("AC-like", "OPC-like", "Progenitor")]
+summed_sce$Annotation <- "Tumor"
+
+de_results2 <- pseudoBulkDGE(summed_sce, 
+    label = summed_sce$Annotation,
+    design = ~ Status + Patient,  
+    coef = "StatusSurgery"
+)
+
+chosen <- as.data.frame(de_results2$Tumor)
+chosen <- chosen[!is.na(chosen$logFC),]
+order <- chosen[order(chosen$PValue), ]
+#write.csv(order, file="output/deg_genefilt_tumor.csv")
+
+ranked_list <- list()
+for (i in names(de_results2)) {
+  
+  de_sub <- de_results2[[i]] 
+  
+  pvals <- de_sub$PValue
+  logFC <- de_sub$logFC
+  signed_pvals <- sign(logFC) * -log10(pvals)
+  
+  ranked_genes_signed_pvals <- setNames(signed_pvals, rownames(de_sub))
+  ranked_genes_signed_pvals <- sort(ranked_genes_signed_pvals, decreasing = TRUE)
+  
+  ranked_list[[i]] <- ranked_genes_signed_pvals
+  
+}
+
+res <- as.data.frame(ranked_list$Tumor)
+colnames(res) <- "Rank"
+#write.csv(res, file = "output/gsea_ranked_genes_tumor.csv", row.names = TRUE)
+
+set.seed(1010010)
+gsea_results <- list()
+for (i in names(ranked_list)) {
+  
+  ranked_genes <- ranked_list[[i]]
+  
+  fgsea_res <- fgsea(
+    pathways = gene_sets,         
+    stats = ranked_genes,          
+  )
+  
+  gsea_results[[i]] <- fgsea_res
+}
+
+res <- gsea_results$Tumor
+res <- res %>%
+    filter(padj < 0.05) %>%
+    arrange(desc(NES)) %>%
+    select(-leadingEdge, -ES)
+#write.csv(res, file = "output/gsea_tumor.csv")
+
+gsea <- gsea_results[["Tumor"]]
+gsea <- na.omit(gsea)
+plot <- ggplot(gsea, aes(x = NES, y = -log10(padj), color = pathway)) +
+  geom_point(size = 5) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  labs(x = "Normalised Enrichment Score (NES)", y = "-log10(adjusted p-value)", title = "All Tumor") +
+  geom_text_repel(data = gsea %>% filter(NES > 0) %>% slice_max(order_by = -log10(padj), n = 18),
+                  aes(label = pathway), color = "black", size = 1.5) +
+  geom_text_repel(data = gsea %>% filter(NES < 0) %>% slice_max(order_by = -log10(padj), n = 18),
+                  aes(label = pathway), color = "black", size = 1.5) +
+  geom_text_repel(data = gsea %>% filter(pathway == "GOBP_PYRIMIDINE_NUCLEOBASE_METABOLIC_PROCESS"), 
+                  aes(label = pathway), color = "black", size = 1.5, nudge_y = 0.3) +
+  geom_point(data = gsea %>% filter(pathway %in% c("AC-like", "Astrocyte", "G1S", "G2M", "MES-like", "NPC-like", "Oligodendrocyte", "OPC", "OPC-like")),
+             aes(x = NES, y = -log10(padj)), size = 9) +
+  scale_color_manual(values = c("AC-like" = "#F28482", "G1S" = "blue", "G2M" = "green", "OPC-like" = "#6A994E", 
+                                "NPC-like" = "#3A7CA5", "MES-like" = "#9D4EDD", "Astrocyte" = "#F9C8C7", 
+                                "Oligodendrocyte" = "#CDDEB9", "OPC" = "#A7C957"),
+                     na.value = "lightgrey") +
+  theme_classic() + 
+  theme(legend.position = "right")
+print(plot)
+```
+
+```{r}
+for(i in names(ranked_list)){
+    gsea_subset <- ranked_list[[i]]
+    stat <- as.data.frame(gsea_subset)
+    stat <- cbind(rownames(stat), stat)
+    colnames(stat) <- c("gene", "stat")
+    
+    stat <- merge(stat, program_data, by = "gene", all.x = TRUE)
+    stat <- stat[order(stat$stat),]  # Sort by stat
+    
+    # Define the range of stat
+    min_stat <- min(stat$stat)
+    max_stat <- max(stat$stat)
+
+    # Calculate the window range
+    step_size <- 0.10
+    window_size <- 30  # Approximate number of genes per window
+
+    # Create a sequence of window centers
+    window_centers <- seq(min_stat, max_stat, by = step_size)
+    
+    # Create windows around each center to contain approximately 30 genes
+    window_limits <- lapply(window_centers, function(center) {
+        lower_bound <- center - (step_size / 2)
+        upper_bound <- center + (step_size / 2)
+        close_genes <- stat$stat >= lower_bound & stat$stat < upper_bound
+        # Adjust bounds if less than 30 genes are found
+        while(sum(close_genes) < window_size && (lower_bound > min_stat || upper_bound < max_stat)) {
+            if (lower_bound > min_stat) lower_bound <- lower_bound - step_size / 4
+            if (upper_bound < max_stat) upper_bound <- upper_bound + step_size / 4
+            close_genes <- stat$stat >= lower_bound & stat$stat < upper_bound
+        }
+        list(start = lower_bound, end = upper_bound)
+    })
+
+    # percentages for each window
+    calc_percentages <- function(limits) {
+        subset <- stat %>%
+            filter(stat >= limits$start, stat < limits$end, !is.na(Program)) 
+        
+        total_genes <- nrow(subset)
+        all_programs <- unique(program_data$Program)
+        
+        if(total_genes == 0) {
+            return(data.frame(Program = all_programs, Percentage = 0, Window = (limits$start + limits$end) / 2))
+        }
+
+        percentages <- subset %>%
+            dplyr::group_by(Program) %>%
+            dplyr::summarise(Percentage = n() / total_genes * 100, .groups = 'drop')
+        
+        complete_percentages <- merge(data.frame(Program = all_programs), percentages, by = "Program", all.x = TRUE)
+        complete_percentages[is.na(complete_percentages$Percentage), "Percentage"] <- 0
+        complete_percentages$Window <- (limits$start + limits$end) / 2
+        
+        return(complete_percentages)
+    }
+    stat <- na.omit(stat)
+
+    percentages <- lapply(window_limits, calc_percentages)
+    percentages_df <- do.call(rbind, percentages)
+
+    plot <- ggplot(percentages_df, aes(x = Window, y = Percentage, color = Program)) +
+        geom_point(alpha = 0.5, size = 0.8) +
+        geom_smooth(method = "loess", span = 0.5, se = FALSE) +
+        labs(title = paste0(i, " - Enrichment of Ranked List"),
+             x = "Pre-treatment vs Post-treatment [-log10(p-value)*sign(logFC)]",
+             y = "% Genes in Tumour Program [in sliding window]",
+             color = "Gene Program") +
+        theme_classic() + 
+        scale_y_continuous(limits = c(0, 100), breaks = seq(0, 100, by = 10)) +
+        scale_color_manual(values = c("AC-like" = "#F28482", "OPC-like" = "#6A994E", "NPC-like" = "#3A7CA5", "MES-like" = "#9D4EDD"))
+
+    print(plot)
+    
+    ggsave(filename = paste0("figures/gsea_loess_", i, ".svg"), plot = plot)
+}
+```
+
+```{r}
+# semantic barplot (GSEA from DEG results)
+semantic <- read_xlsx("output/gsea_results_semantic.xlsx", sheet = "semantic count") #unsupervised groupings of these terms
+colnames(semantic)[1] <- c("Pathway")
+semantic <- semantic[-11, ]
+semantic$Pathway <- factor(semantic$Pathway, levels = c("other", "DNA damage and stress", "lipid / energy metabolism", "Chromosome and DNA related", "cell structure", "secretion and cell communication", "aerobic glycolysis/ energymetabolism", "inflammation", "Cell division and ribosome", "neural synapse related"))
+
+long_semantic <- semantic %>%
+  pivot_longer(cols = -Pathway, names_to = "sample", values_to = "Count") %>%
+  separate(sample, into = c("cell_type", "Condition"), sep = "_") %>%
+  mutate(Count = if_else(Condition == "pre-treatment", -Count, Count),
+         Condition = recode(Condition, "pre-treatment" = "Pre-treatment", "post-treatment" = "Post-treatment"))
+
+long_semantic <- long_semantic %>%
+  mutate(cell_type = recode(cell_type,
+                            tumour = "Tumor",
+                            progenitor = "Progenitor",
+                            aclike = "AC-like",
+                            astrocyte = "Astrocyte",
+                            immune = "Immune", 
+                            neuron = "Neuron",
+                            oligo = "Oligodendrocyte",
+                            opclike = "OPC-like"))
+
+plots <- long_semantic %>%
+  split(.$cell_type) %>%
+  map(~ ggplot(data = .x, aes(x = Pathway, y = Count, fill = Condition)) +
+         geom_bar(stat = "identity") +
+         coord_flip() +
+         scale_fill_manual(values = colours_sample) +
+         labs(x = "Semantic Pathway", y = "Count", fill = "Condition") +
+         ggtitle(paste(.x$cell_type[1])) +
+         theme_classic())
+plots
+
+for (i in names(plots)) {
+  p <- plots[[i]]
+  filename <- paste0("figures/semantic_barplot_", gsub(" ", "_", tolower(i)), ".svg")
+  ggsave(filename, plot = p, width = 10, height = 8, dpi = 300)
+}
+
+# semantic dotplot (each column equal 1)
+semantic <- read_xlsx("output/gsea/gsea_results_semantic.xlsx", sheet = "semantic count")
+colnames(semantic)[1] <- "Pathway"
+semantic <- semantic %>%
+  rename_with(.cols = ends_with("_pre-treatment"), .fn = ~ sub("_pre-treatment", "_Pre-treatment", .)) %>%
+  rename_with(.cols = ends_with("_post-treatment"), .fn = ~ sub("_post-treatment", "_Post-treatment", .))
+
+long_semantic <- semantic %>%
+  filter(Pathway != "Total") %>%
+  pivot_longer(cols = -Pathway, names_to = "sample", values_to = "Count") %>%
+  separate(sample, into = c("cell_type", "Condition"), sep = "_") %>%
+  pivot_wider(names_from = Condition, values_from = Count, values_fill = list(Count = 0))
+
+desired_order <- c("other", "DNA damage and stress", "lipid / energy metabolism", "Chromosome and DNA related", "cell structure", "secretion and cell communication", "aerobic glycolysis/ energymetabolism", "inflammation", "Cell division and ribosome", "neural synapse related")
+long_semantic$Pathway <- factor(long_semantic$Pathway, levels = desired_order)
+
+total_counts <- semantic %>%
+  filter(Pathway == "Total") %>%
+  pivot_longer(cols = -Pathway, names_to = "sample", values_to = "Total") %>%
+  separate(sample, into = c("cell_type", "Condition"), sep = "_") %>%
+  pivot_wider(names_from = Condition, values_from = Total, values_fill = list(Total = 0)) %>%
+  mutate(Total = Pre-treatment + Post-treatment) %>%
+  dplyr::select(cell_type, Total)
+
+long_semantic <- long_semantic %>%
+  left_join(total_counts, by = "cell_type") %>%
+  mutate(
+    Proportion = (Pre-treatment + Post-treatment) / Total,
+    DirectionIndex = Pre-treatment / (Pre-treatment + Post-treatment)
+  )
+long_semantic$DirectionIndex[is.na(long_semantic$DirectionIndex)] <- 0.5
+
+plot <- ggplot(long_semantic, aes(x = cell_type, y = Pathway, size = Proportion, color = DirectionIndex)) +
+  geom_vline(xintercept = seq_along(unique(long_semantic$cell_type)), color = "grey90") + 
+  geom_point(alpha = 0.75) +
+  scale_size_area(max_size = 10) +
+  scale_color_gradient(low = "#E66100", high = "#0C7BDC") + 
+  labs(x = "Cell Type", y = "Semantic Pathway", size = "Proportion of Total Significant Pathways", color = "Enrichment Direction") +
+  theme_classic() +
+  scale_x_discrete(labels = c(
+  "tumour" = "Tumor",
+                            "progenitor" = "Progenitor",
+                            "aclike" = "AC-like",
+                            "astrocyte" = "Astrocyte",
+                            "immune" = "Immune", 
+                            "neuron" = "Neuron",
+                            "oligo" = "Oligodendrocyte",
+                            "opclike" = "OPC-like"
+)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+plot
+```
+
+# DEG boxplots
+
+```{r}
+# tumor cell populations only
+sce_tum$Treatment <- paste0(sce_tum$annotation, "_", sce_tum$Sample_Type)
+
+expr_data_long <- logcounts(sce_tum)[rownames(logcounts(sce_tum)) %in% c("BMPER", "MYRF"), ] %>%
+  t() %>%
+  as.data.frame() %>%
+  mutate(Patient = sce_tum$Patient, Treatment = sce_tum$Treatment) %>%
+  group_by(Patient, Treatment) %>%
+  summarise(across(all_of(c("BMPER", "MYRF")), 
+                   list(mean_expr = function(x) mean(x, na.rm = TRUE),  # Mean expression per patient and treatment
+                        prop_expr = function(x) mean(x > 0, na.rm = TRUE)))) %>%
+  pivot_longer(cols = starts_with(c("BMPER", "MYRF")), 
+               names_to = c("Gene", ".value"), 
+               names_sep = "_")
+expr_data_long$Patient <- factor(expr_data_long$Patient, levels=c("A-01", "A-02", "A-03", "A-05", "A-06", "A-07", "O-01", "O-02", "O-03"))
+
+col <- c("AC-like_Pre-treatment" = "#0C7BDC", "AC-like_Post-treatment" = "#E66100", "OPC-like_Pre-treatment" = "#0C7BDC", "OPC-like_Post-treatment" = "#E66100", "Progenitor_Pre-treatment" = "#0C7BDC", "Progenitor_Post-treatment" = "#E66100")
+
+plot <- ggplot(expr_data_long, aes(x = Treatment, y = mean, colour = Patient)) +
+  geom_boxplot(aes(group = Treatment, fill = Treatment), alpha = 0.5, outlier.shape = NA) + 
+  geom_point(size = 2) +  
+  facet_wrap(~ Gene, scales = "free_y") +
+  theme_classic() +
+  scale_colour_manual(values = colours) +
+  scale_fill_manual(values = col) +
+  labs(x = NULL, 
+       y = "Average log expression", 
+       colour = "Participant") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), 
+        strip.text = element_text(size = 10))
+```

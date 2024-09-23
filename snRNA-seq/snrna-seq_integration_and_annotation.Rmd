@@ -1,0 +1,529 @@
+---
+title: "Integration and annotation of snRNA-seq data"
+output: html_document
+---
+
+The following code relates to the sample integration (via scVI) and cell-type annotation of processed snRNA-seq data.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(reticulate)
+library(zellkonverter)
+library(SummarizedExperiment)
+library(HDF5Array)
+library(SingleCellExperiment)
+library(intrinsicDimension)
+library(scater)
+library(scuttle)
+library(BiocParallel)
+library(org.Hs.eg.db)
+library(bluster)
+library(magrittr)
+library(dplyr)
+library(scran)
+```
+
+## Integration
+
+# Combine all processed snRNA-seq samples
+
+```{r}
+input_dir <- '/data/tmp/'
+output_dir <- '/data/process/'
+
+sce_list <- list()
+file_names <- list.files(input_dir, pattern = 'clustered.rds')
+for (file_name in file_names) {
+    sce <- readRDS(paste0(input_dir, file_name))
+    sce <- sce[sort(rownames(sce)),]  
+    counts(sce) <- as(counts(sce), 'dgCMatrix')  
+    logcounts(sce) <- as(logcounts(sce), 'dgCMatrix')  
+    sce_list[[length(sce_list) + 1]] <- sce  
+}
+min_pca_dims <- min(sapply(sce_list, function(sce) {
+    if (!is.null(reducedDims(sce)$PCA)) {
+        return(ncol(reducedDims(sce)$PCA))
+    } else {
+        return(Inf)  
+    }
+}))
+
+sce_list <- lapply(sce_list, function(sce) {
+    if (!is.null(reducedDims(sce)$PCA)) {
+        pca_data <- reducedDims(sce)$PCA
+        reducedDims(sce)$PCA <- pca_data[, 1:min_pca_dims, drop = FALSE]
+    }
+    return(sce)
+})
+sce <- do.call(cbind, sce_list)
+sce
+
+rm(sce_list)
+gc()
+
+sce$Sample_Type <- ifelse(grepl("_01", sce$sample), "Pre-treatment", "Post-treatment")
+sce$Patient <- sub("(_.*)", "", sce$sample)
+```
+
+```{r}
+df <- as.data.frame(colData(sce))
+ggplot(df, aes(x=sample, y=detected, color=sample)) + geom_violin() + labs(title="Detected Genes",x="Sample", y = "Detected Genes per cell") + theme_classic() 
+ggplot(df, aes(x=sample, y=sum, color=sample)) + geom_violin() + labs(title="Read Count",x="Sample", y = "Reads") + theme_classic()
+```
+
+combined together, we have `r ncol(sce)` cells (>200000 cells) across `r length(unique(sce$Sample))` Samples;
+HOWEVER, to set a general threshold for minimum counts, we will redo MAD filtering across all of our samples. 
+
+```{r general MAD filtering}
+mad_sum <- 2^(median(log2(colSums(counts(sce))))-3*mad(log2(colSums(counts(sce)))))
+mad_sum
+
+mad_detected <- 2^(median(log2(colSums(counts(sce)>0)))-3*mad(log2(colSums(counts(sce)>0))))
+mad_detected
+
+keep <- colSums(counts(sce)) > mad_sum & colSums(counts(sce)>0) > mad_detected
+sce <- sce[, keep]
+```
+
+After MAD filtering, 189680 cells remain.
+
+```{r}
+df <- reducedDim(sce, "UMAP")
+df <- as.data.frame(df)
+df$sample <- sce$sample
+df$sum <- sce$sum
+df$detected <- sce$detected
+colnames(df)[1:2] <- c("UMAP1", "UMAP2")
+
+ggplot(df, aes(x=sample, y=detected, color=sample)) + geom_violin() + labs(title="Detected Genes",x="Sample", y = "Detected Genes per cell") + theme_classic() 
+ggplot(df, aes(x=sample, y=sum, color=sample)) + geom_violin() + labs(title="Read Count",x="Sample", y = "Reads") + theme_classic()
+
+ggplot(df, aes(x=UMAP1, y=UMAP2, color=log10(sum))) + geom_point(alpha=0.5) + theme_classic() + scale_color_viridis_c()
+ggplot(df, aes(x=UMAP1, y=UMAP2, color=log10(detected))) + geom_point(alpha=0.5) + theme_classic() + scale_color_viridis_c()
+
+ggplot(df, aes(x=log10(sum))) +
+  geom_histogram(bins=150) +
+  ggtitle("Total Counts") + theme_classic()
+ggplot(df, aes(x=log10(detected))) +
+  geom_histogram(bins=150) +
+  ggtitle("Detected Genes") + theme_classic()
+
+# further filter low quality cells (sum < 1000)
+keep <- colSums(counts(sce)) > 1000
+sce <- sce[, keep]
+```
+
+After threshold filtering, 178567 cells remain.
+
+```{r save}
+saveRDS(sce, paste0(output_dir, 'sce_all.rds'))
+
+sce <- readRDS(paste0(output_dir, 'sce_all.rds'))
+```
+
+SCE converted to adata object for scVI sample integration:
+
+```{r}
+ad <- import("anndata", convert = FALSE)
+
+dfobs <- data.frame(colData(sce))
+dfvar <- data.frame(rowData(sce))
+counts_matrix <- as.matrix(t(counts(sce)))
+adata <- ad$AnnData(
+  X=counts_matrix,
+  obs=dfobs,
+  var=dfvar,
+  layers=list('logcounts'=as.matrix(t(sce@assays@data$logcounts))),
+  obsm=list('X_umap'=reducedDim(sce, "UMAP"), 'X_pca'=reducedDim(sce, "PCA")) 
+  )
+adata
+
+adata$write_h5ad("/data/process/adata_all.h5ad", compression='gzip')
+```
+
+# scVI Batch Corrected
+
+Here, we implement the scVI tool for integration of biopsy and surgery samples from the above stated AnHeart patients. We follow this tutorial: {https://docs.scvi-tools.org/en/stable/tutorials/notebooks/scrna/scvi_in_R.html}. 
+
+scvi-tools (single-cell variational inference tools) is a package for probabilistic modeling and analysis of single-cell omics data. It is a suite of machine learning models that may be used and adapted to perform specific analysis tasks such as dataset integration. 
+
+scVI integration for batch correction run via python script: `scvi_integration.py`. Default Epochs = 94.
+
+scVI output converted back to SCE, processed (UMAP) and clustered:
+
+```{r}
+sc <- import("scanpy", convert = FALSE)
+
+adata <- sc$read('/data/process/scvi_adata_all.h5ad')
+
+# convert to SCE object
+sce <- AnnData2SCE(adata)
+
+# UMAP dimensionality reduction on scVI reduced dimensions
+set.seed(0010101010)
+sce <- runUMAP(sce, dimred="X_scVI",
+                    BPPARAM=MulticoreParam(10), n_neighbors = 15, spread = 3, min_dist = 0.1)
+
+# Cluster
+set.seed(0010101010)
+Clusters <- scran::clusterCells(sce, use.dimred="X_scVI", 
+                                BLUSPARAM=SNNGraphParam(k=98, type="rank", cluster.fun="leiden"))
+table(Clusters)
+sce$Cluster <- Clusters
+
+saveHDF5SummarizedExperiment(sce, "/data/process/", prefix="sce_integrated_", replace = TRUE)
+```
+
+
+
+## Annotation
+
+# Load integrated object
+
+```{r}
+sce_comb <- loadHDF5SummarizedExperiment("/data/process/", prefix="sce_integrated_")
+```
+
+```{r}
+# visualise integrated dataset
+df <- as.data.frame(reducedDim(sce_comb, "UMAP"))
+df$sample <- sce_comb$sample
+df$Patient <- sce_comb$Patient
+df$Sample_Type <- sce_comb$Sample_Type
+df$sum <- sce_comb$sum
+df$detected <- sce_comb$detected
+
+ggplot(df[sample(1:nrow(df)),], aes(x=UMAP1, y=UMAP2, color=sample)) + geom_point(alpha=0.5) + 
+  theme_classic() +
+guides(colour = guide_legend(override.aes = list(alpha = 1, size=3)))
+
+ggplot(df[sample(1:nrow(df)),], aes(x=UMAP1, y=UMAP2, color=Patient)) + geom_point(alpha=0.5) + 
+  theme_classic() +
+guides(colour = guide_legend(override.aes = list(alpha = 1, size=3)))
+
+ggplot(df[sample(1:nrow(df)),], aes(x=UMAP1, y=UMAP2, color=Sample_Type)) + geom_point(alpha=0.5) + 
+  theme_classic() +
+guides(colour = guide_legend(override.aes = list(alpha = 1, size=3)))
+
+ggplot(df, aes(x=UMAP1, y=UMAP2, color=log10(sum))) + geom_point(alpha=0.5) + theme_classic() + scale_color_viridis_c()
+ggplot(df, aes(x=UMAP1, y=UMAP2, color=log10(detected))) + geom_point(alpha=0.5) + theme_classic() + scale_color_viridis_c()
+```
+
+```{r}
+df$Cluster <- sce_comb$Cluster
+
+colours_clusters <- Polychrome::palette36.colors(36)
+names(colours_clusters) <- 1:36
+
+ggplot(df[sample(1:nrow(df)),], aes(x=UMAP1, y=UMAP2, color=Cluster)) + geom_point(alpha=0.5) + 
+  theme_classic() +
+guides(colour = guide_legend(override.aes = list(alpha = 1, size=3))) + scale_color_manual(values=colours_clusters)
+```
+
+# Annotation
+
+Reference-based automatic SingleR annotation ran on integrated dataset via: `annotate_data.R`
+
+References used:
+
+* Ruiz-Moreno et al. 2022
+* Couturier et al. 2020
+* Herring et al. 2022 (Lister)
+
+Gene inputs used for annotation:
+
+* Common HVGs between the query and reference datasets
+
+```{r}
+# load SingleR annotation results
+load(file = "/data/anno_results_ruiz.RData")
+sce_comb$CommonHVGs_ruiz <- anno.comHVGs
+load(file = "/data/anno_results_cout.RData")
+sce_comb$CommonHVGs_cout <- anno.comHVGsC
+load(file = "/data/anno_results_lister.RData")
+sce_comb$CommonHVGs_lister <- anno.comHVGsL
+
+# colours
+## ruiz
+colours_pop <- Polychrome::palette36.colors(21)
+names(colours_pop) <- c("AC-like","Astrocyte","MES-like","Mural cell","Neuron","Oligodendrocyte","OPC","OPC-like","RG","Endothelial","NPC-like", "Mono", "TAM-BDM", "TAM-MG", "DC", "Mast", "CD4/CD8", "NK", "B Cell", "Plasma B", "Other")
+## couturier
+colours_popC <- Polychrome::palette36.colors(7)
+names(colours_popC) <- c("Astro","Mesenchymal","Neuronal","Oligo","Progenitor","Unassigned", "Other")
+```
+
+```{r, echo=FALSE}
+## ruiz
+plotReducedDim(object = sce_comb, dimred = "UMAP", colour_by = "CommonHVGs_ruiz") + theme(aspect.ratio = 1)+ ggtitle("Ruiz-Moreno Annotation")+
+  scale_color_manual(values=colours_pop)
+## couturier
+plotReducedDim(object = sce_comb, dimred = "UMAP", colour_by = "CommonHVGs_cout") + theme(aspect.ratio = 1)+ ggtitle("Couturier Annotation")+
+  scale_color_manual(values=colours_popC)
+
+# Astro and Microglia and Oligo
+sce_subset <- sce_comb
+astro_or_micro_cells <- grepl("^Astro", sce_subset$CommonHVGs_lister) | grepl("^Micro", sce_subset$CommonHVGs_lister) | grepl("^Oligo", sce_subset$CommonHVGs_lister)
+colData(sce_subset)$CommonHVGs_lister[!astro_or_micro_cells] <- "Other_celltype"
+
+plotReducedDim(object = sce_subset, dimred = "UMAP", colour_by = "CommonHVGs_lister") + theme(aspect.ratio = 1)+ ggtitle("Lister Astro, Microglia & Oligo Cells")
+```
+
+## Inspect gene expression
+
+```{r}
+markers <- function(x, marker){
+  x$marker <- as.vector(logcounts(x[marker,]))
+  plot_data <- data.frame(UMAP1 = reducedDim(x, "UMAP")[,1],
+                          UMAP2 = reducedDim(x, "UMAP")[,2],
+                          Expression = x$marker)
+  plot_data <- plot_data[order(plot_data$Expression), ]
+  plot <- ggplot(plot_data, aes(x = UMAP1, y = UMAP2, color = Expression)) +
+    geom_point(size=0.5) + 
+    theme(aspect.ratio = 1) + 
+    ggtitle(marker) + 
+    scale_color_viridis_c() +
+      theme_classic()
+  return(plot)
+}
+```
+
+### AC-like
+
+```{r, echo=FALSE}
+marker_genes <- c("APOE","AQP4", "MGAT4C", "SPARCL1", "GFAP", "ALDOC")
+lapply(marker_genes, function(marker) markers(sce_comb, marker))
+```
+
+### MES-like
+
+```{r, echo=FALSE}
+marker_genes <- c("PDGFRA", "CHI3L1", "TNC", "ITGB1", "NRN1", "TIMP1", "PHLDA2", "S100A10")
+lapply(marker_genes, function(marker) markers(sce_comb, marker))
+```
+
+### OPC-like
+
+```{r, echo=FALSE}
+marker_genes <- c("APOD", "OLIG1", "OLIG2", "DLL3", "SOX8", "PTMA", "PDGFRA")
+lapply(marker_genes, function(marker) markers(sce_comb, marker))
+```
+
+### Progenitor
+
+```{r, echo=FALSE}
+marker_genes <- c("TOP2A", "MKI67", "CENPF", "TUBA1B")
+lapply(marker_genes, function(marker) markers(sce_comb, marker))
+```
+
+### NPC-like
+
+```{r, echo=FALSE}
+marker_genes <- c("SOX11", "HES6", "STMN2", "LMO4", "TUBB3", "RAB3C", "S100A1", "DLX5", "ELAVL4", "SOX4", "CCND2", "RBM6", "SET", "TRA2A")
+lapply(marker_genes, function(marker) markers(sce_comb, marker))
+```
+
+### Neuron
+
+```{r}
+marker_genes <- c("NPTXR", "STMN2", "CDH13", "C1QL3", "THY1", "LMO4")
+lapply(marker_genes, function(marker) markers(sce_comb, marker))
+
+# excitatory
+marker_genes <- c("NRN1", "HOPX", "HS3ST4", "TRPM3", "EPHA4", "LMO4")
+lapply(marker_genes, function(marker) markers(sce_comb, marker))
+
+# inhibitory
+marker_genes <- c("MAF", "GRIK1", "SPOCK3", "KIT")
+lapply(marker_genes, function(marker) markers(sce_comb, marker))
+
+# interneuron
+marker_genes <- c("SST", "PVALB", "VIP", "CCK", "CRH", "HTR3A", "GAD1", "GAD2")
+lapply(marker_genes, function(marker) markers(sce_comb, marker))
+# VIP, CCK, CRH - VIP (Vasoactive Intestinal Peptide) interneurons
+
+#  CORTICAL LAYERS
+# layer 2
+marker_genes <- c("CUX2", "FGF13", "MEF2C", "STMN2", "LAMP5")
+lapply(marker_genes, function(marker) markers(sce_comb, marker))
+
+# layer 3
+marker_genes <- c("PRSS12", "CUX2")
+lapply(marker_genes, function(marker) markers(sce_comb, marker))
+
+# layer 4
+marker_genes <- c("RORB", "SATB2", "FOXP2", "FOXP1", "LRRK1", "MET", "MME")
+lapply(marker_genes, function(marker) markers(sce_comb, marker))
+
+# layer 5/6
+marker_genes <- c("THEMIS", "TLE4", "SATB2", "FOXP1", "CNR1", "NTNG2", "SOX5", "TLE4", "FOXP2", "NFIB", "BCL11B", "HS3ST4", "TUBA1A", "SCUBE1", "SORCS1", "HTR2C", "NFIB", "BCL11B")
+lapply(marker_genes, function(marker) markers(sce_comb, marker))
+```
+
+### OPC
+
+```{r}
+marker_genes <- c("CNP", "CA10",  "APOD", "GPNMB", "CSPG4", "CD9")
+lapply(marker_genes, function(marker) markers(sce_comb, marker))
+```
+
+### Endothelial
+
+```{r, echo=FALSE}
+marker_genes <- c("IGFBP7", "DCN", "COL4A2")
+lapply(marker_genes, function(marker) markers(sce_comb, marker))
+```
+
+### Astrocyte
+
+```{r, echo=FALSE}
+marker_genes <- c("MGST1", "NTRK2", "SLC1A3", "SLC1A2", "FAM107A", "CST3", "GJA1")
+lapply(marker_genes, function(marker) markers(sce_comb, marker))
+
+# reactive astrocyte
+marker_genes <- c("ANXA1", "TSC22D1", "FBLN1", "TGFB1", "CCNA1", "FOXJ1")
+lapply(marker_genes, function(marker) markers(sce_comb, marker))
+```
+
+### Oligodendrocyte
+
+```{r, echo=FALSE}
+marker_genes <- c("ERMN", "MBP", "MAL", "MOG")
+lapply(marker_genes, function(marker) markers(sce_comb, marker))
+```
+
+### Immune Markers
+
+```{r, echo=FALSE}
+# Immune Markers
+
+## T Cell
+marker_genes <- c("CD4", "CD8A", "CCR7", "CD27", "PTPRC", "CD28", "KLRB1", "CD69", "FOXP3")
+lapply(marker_genes, function(marker) markers(sce_comb, marker))
+## B-cells
+marker_genes <- c("CD19", "CD79A", "BANK1")
+lapply(marker_genes, function(marker) markers(sce_comb, marker))
+## Macrophage
+marker_genes <- c("CD163", "CD68")
+lapply(marker_genes, function(marker) markers(sce_comb, marker))
+## Neutrophil
+marker_genes <- c("ITGAX", "SLC11A1", "CXCR1")
+lapply(marker_genes, function(marker) markers(sce_comb, marker))
+## Monocyte
+marker_genes <- c("VCAN", "FCER1G", "CD14")
+lapply(marker_genes, function(marker) markers(sce_comb, marker))
+## Dendritic Cell
+marker_genes <- c("FCER1A", "S100A4", "HLA-DQA1", "HLA-DQB1")
+lapply(marker_genes, function(marker) markers(sce_comb, marker))
+## NK cells
+marker_genes <- c("KLRC1", "GNLY") 
+lapply(marker_genes, function(marker) markers(sce_comb, marker))
+## Microglia
+marker_genes <- c("P2RY12", "CX3CR1")
+lapply(marker_genes, function(marker) markers(sce_comb, marker))
+```
+
+### Hypoxia
+
+```{r, echo=FALSE}
+marker_genes <- c("NPPC", "CA9", "HILPDA", "SERPINE1")
+lapply(marker_genes, function(marker) markers(sce_comb, marker))
+```
+
+## Death Pathways
+
+```{r, echo=FALSE}
+# Death pathways
+tab <- AnnotationDbi::select(org.Hs.eg.db, keytype="SYMBOL", keys=as.character(rownames(sce_comb)), columns="GOALL")
+by.go <- split(tab[,1], tab[,2])
+by_go_death <- by.go[c("GO:0097707", "GO:0006915", "GO:0048102", "GO:0070265", "GO:0007219")]
+aggregated <- sumCountsAcrossFeatures(sce_comb, by_go_death,
+    exprs_values="logcounts", average=FALSE)
+aggregated <- t(apply(aggregated, 1, function(x) x/sce_comb$sum))
+
+df$Ferroptosis <- aggregated[1,]
+df$Apoptosis <- aggregated[2, ]
+df$AutophagicCellDeath <- aggregated[3, ]
+df$Necrosis <- aggregated[4, ]
+df$Notch <- aggregated[5,]
+
+ggplot(df, aes(x=UMAP1, y=UMAP2, color=Notch)) + geom_point(alpha=0.5) + theme_classic() + scale_color_viridis_c()
+ggplot(df, aes(x=UMAP1, y=UMAP2, color=Ferroptosis)) + geom_point(alpha=0.5) + theme_classic() + scale_color_viridis_c()
+ggplot(df, aes(x=UMAP1, y=UMAP2, color=Apoptosis)) + geom_point(alpha=0.5) + theme_classic() + scale_color_viridis_c()
+ggplot(df, aes(x=UMAP1, y=UMAP2, color=AutophagicCellDeath)) + geom_point(alpha=0.5) + theme_classic() + scale_color_viridis_c()
+ggplot(df, aes(x=UMAP1, y=UMAP2, color=Necrosis)) + geom_point(alpha=0.5) + theme_classic() + scale_color_viridis_c()
+```
+
+## Final Annotation
+
+```{r, echo=FALSE}
+# Final annotation
+annotation <- read.csv(file = "/data/process/annotations.csv")
+sce_comb$annotation <- annotation$annotation[match(sce_comb$Cluster, annotation$cluster)]
+sce_comb$annotation <- factor(sce_comb$annotation)
+df$annotation <- sce_comb$annotation
+
+colours_anno <- c("#F28482", "#9D4EDD", "#6A994E", "#3A7CA5", "#EF233C",
+               "#F9C8C7", "#CDDEB9", "#A7C957", "#63A2C8", "#000000", "#FFEA00", "#F4F3EE",
+               "#FAA307", "#FFBA08", "#FFD60A", "#E85D04", "#F48C06", "#F2CC8F",
+               "#656D4A", "#A4AC86", "#B6AD90", "#7F4F24", "#A68A64", "#D6D1C1",
+               "#000000", "#ADB5BD",
+               "#9D0208")
+names(colours_anno) <- c("AC-like", "MES-like", "OPC-like", "NPC-like", "Progenitor",
+                      "Astrocyte", "Oligodendrocyte", "OPC", "Neuron", "Vasculature", "Immune", "Unknown",
+                      "T Cell", "NK Cell", "B Cell", "CD8 T Cell", "CD4 T Cell", "T Reg Cell", 
+                      "Dendritic Cell", "Neutrophil", "Monocyte", "Microglia", "Macrophage", "Mast Cell",
+                      "Endothelial", "Mural",
+                      "Death")
+
+ggplot(df[sample(1:nrow(df)),], aes(x=UMAP1, y=UMAP2, color=annotation)) + geom_point(alpha=0.5) + 
+  theme_classic() + 
+guides(colour = guide_legend(override.aes = list(alpha = 1, size=3))) + scale_color_manual(values=colours_anno) 
+
+df %>%
+  dplyr::count(annotation, sample) %>%       
+  dplyr::group_by(sample) %>%
+  dplyr::mutate(pct= prop.table(n) * 100) %>%
+  ggplot(aes(y=sample, x=pct, fill=annotation)) +
+  geom_bar(stat="identity") +
+  theme_bw()+ scale_fill_manual(values=colours_anno) 
+
+colnames(sce_comb) <- sce_comb$Barcode
+```
+
+```{r}
+df_summary <- df %>%
+  group_by(Patient, Sample_Type, annotation) %>%
+  summarise(Count = n(), .groups = 'drop') %>%
+  group_by(Patient, Sample_Type) %>%
+  mutate(Proportion = Count / sum(Count))
+
+plot_donut <- function(patient_data, patient_id) {
+  p <- ggplot(patient_data, aes(x = 2, y = Proportion, fill = annotation)) +
+    geom_bar(stat = "identity", width = 1) +
+    coord_polar(theta = "y") +
+    xlim(0.5, 2.5) +
+    theme_void() +
+    facet_wrap(~Sample_Type) +
+    labs(title = paste(patient_id),
+         fill = "Annotation") +
+    scale_fill_manual(values = colours_anno)
+
+  #ggsave(paste0("figures/donutplot_", patient_id, ".svg"), plot = p)
+  
+  return(p)
+}
+
+for(patient in unique(df_summary$Patient)) {
+  patient_data <- filter(df_summary, Patient == patient)
+  print(patient)
+  p <- plot_donut(patient_data, patient)
+  print(p)
+}
+```
+
+```{r}
+assayNames(sce_comb)[1] <- "counts"
+
+saveHDF5SummarizedExperiment(sce_comb, "/data/process/", prefix="sce_integrated_annotated_")
+```
+

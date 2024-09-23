@@ -1,0 +1,151 @@
+---
+title: "`r params$doc_title`"
+output: html_document
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+params:
+  doc_title: "Load and doublet removal of snRNA-seq data"
+  Author: "Name"
+  input_dir:
+    label: "Data Directory of CellBender processed data:"
+    input: text
+    value: directory
+  sample:
+    label: "Sample Name"
+    input: text
+    value: A-01_Pre-treatment
+author: "`r params$Author`"
+---
+
+The following code (parameterised report) relates to the loading and doublet detecetion of snRNA-seq data (from CellBender processed matrix)
+
+Processing sample:
+`r params$sample`
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(SingleCellExperiment)
+library(tidyverse)
+library(scater)
+library(scran)
+library(ggplot2)
+library(BiocParallel)
+library(reticulate)
+library(mixtools)
+library(kableExtra)
+library(zellkonverter)
+library(DropletUtils)
+```
+
+Load CellBender processed matrix (used for ambient RNA removal):
+
+CellBender was used to:
+-   estimate and subtract out background noise
+-   distinguish between droplets that contain genuine single-cell signals and those that do not (which would include empty droplets and droplets with ambient RNA)
+
+Example CellBender code:
+
+INPUT_DIR="/data_processed/SNRNA/A-01"
+OUTPUT_DIR="/cellbender/A-01/outs"
+mkdir -p ${OUTPUT_DIR}
+
+cd ${OUTPUT_DIR}
+cellbender remove-background \
+--input ${INPUT_DIR}/outs/raw_feature_bc_matrix.h5 \
+--fpr 0.01 \
+--output ${OUTPUT_DIR}/cellbender_feature_bc_matrix.h5
+
+cp -R ${OUTPUT_DIR} ${INPUT_DIR}/outs/A-01_cellbender_outs
+
+
+```{r}
+sce <- read10xCounts(paste0(params$input_dir, "/", params$sample, '/cellbender_feature_bc_matrix_filtered.h5'))
+
+rownames(sce) <- rowData(sce)$Symbol
+sce_counts <- as.matrix(t(counts(sce)))
+sce$sample <- params$sample
+sce$Sample <- params$sample
+gc()
+```
+
+# Unfiltered Dataset:
+
+-   `r ncol(sce)` cells, `r nrow(sce)` genes
+
+## Inspect unfiltered dataset
+
+```{r, echo=FALSE}
+is.mito <- grep("^MT-", rownames(sce)) 
+sce_qc <- perCellQCMetrics(sce, subsets=list(Mito=is.mito))
+
+sce_qc <- as.data.frame(sce_qc)
+sce_qc$sample <- colData(sce)$Sample
+
+ggplot(sce_qc, aes(x = sum)) +
+  geom_histogram(bins = 50, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept=mean(sum)), color="red", linetype="dashed") +
+  theme_minimal() +
+  labs(title = "Total counts (Unfiltered)",
+       x = "Sum of Counts (bins = 50)",
+       y = "Frequency")
+
+ggplot(sce_qc, aes(x = detected)) +
+  geom_histogram(bins = 50, color = "black", fill = "grey") +
+  geom_vline(aes(xintercept=mean(detected)), color="red", linetype="dashed") +
+  theme_minimal() +
+  labs(title = "Detected counts (Unfiltered)",
+       x = "Number of Detected Counts (bins = 50)",
+       y = "Frequency")
+```
+
+# Quality Control
+
+## Doublet detection
+
+Predict doublet cells via Scrublet:
+
+```{python}
+import scrublet as scr
+import scipy.io 
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+import gzip
+import scipy.sparse as sp
+from scipy.io import mmwrite
+
+# Load counts matrix 
+counts_matrix = r.sce_counts
+
+# Initialize Scrublet object
+scrub = scr.Scrublet(counts_matrix, expected_doublet_rate=0.06)
+
+# Run default pipeline (Doublet simulations, score calculation etc.)
+doublet_scores, predicted_doublets = scrub.scrub_doublets(min_counts=2, 
+                                                          min_cells=3,
+                                                          min_gene_variability_pctl=85, 
+                                                          n_prin_comps=30)
+                                                          
+# Plot doublet score histograms for observed transcriptomes and simulated doublets
+print("Threshold: ", scrub.threshold_) 
+scrub.plot_histogram();
+plt.show()
+```
+
+```{r, include=FALSE}
+colData(sce)$doublet_score <- py$doublet_scores
+colData(sce)$predicted_doublets <- py$predicted_doublets
+table(colData(sce)$predicted_doublets)
+
+# filter doublets
+rm(sce_counts)
+```
+
+-   Doublet threshold = `r py$scrub$threshold_`
+-   `r sum(colData(sce)$predicted_doublets)` doublets detected
+-   `r ncol(sce)` cells remain after filtration
+
+## Output file:
+
+```{r, include=TRUE}
+saveRDS(sce, paste0("/data/tmp/", params$sample, "_sce_raw.rds"))
+```
