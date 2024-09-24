@@ -19,11 +19,11 @@ Affiliations
 (* Shared senior authorship)  
 
 All original code pertaining to analysis for the study is organised in the following multi-omics directories:
-* Metabolomics
-* Spatial_Metabolomics: Spatial metabolomics
-* Spatial_Transcriptomics: 10X Xenium spatial transcriptomics
-* snRNA-seq: 10X Chromium single nuclei RNA sequencing (5' single-end)
-* Methylation_Array: Infinium MethylationEPIC v2.0 BeadChip array
+### * Metabolomics
+### * Spatial_Metabolomics: Spatial metabolomics
+### * Spatial_Transcriptomics: 10X Xenium spatial transcriptomics
+### * snRNA-seq: 10X Chromium single nuclei RNA sequencing (5' single-end)
+### * Methylation_Array: Infinium MethylationEPIC v2.0 BeadChip array
 
 All raw and processed datasets are available from the lead contact upon request. 
 Any additional information required to reanalyze the data reported in the study is available from the lead contact upon request. 
