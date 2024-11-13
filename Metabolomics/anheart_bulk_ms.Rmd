@@ -1,0 +1,1202 @@
+```{r library}
+library(plyr)
+library(reshape2)
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(ggdendro)
+library(gridExtra)
+library(dendextend)
+library(RaMP)
+library(plyr)
+library(reshape2)
+library(dplyr)
+library(ggplot2)
+library(ggdendro)
+library(gridExtra)
+library(dendextend)
+library(ggsignif)
+library(cowplot)
+library(ggrepel)
+```
+
+```{r readfiles}
+# (1) Read LC-data
+lc_tissue = openxlsx::read.xlsx("AnHeart/Metabolomics/MA-SB-847_LCMS_Polar Analysis_Tissue_IDX1.xlsx",
+                                sheet = "LC_Matrix_Tissue_IDX1") 
+# (2) Formating LC-data
+colnames(lc_tissue)[1] = "compound"
+colnames(lc_tissue)[2:ncol(lc_tissue)] = paste0(colnames(lc_tissue)[2:ncol(lc_tissue)],"_",lc_tissue[1,2:ncol(lc_tissue)])
+colnames(lc_tissue) = sub("_[0-9][0-9]_","",colnames(lc_tissue))
+data_entry = lc_tissue[which(grepl(lc_tissue$compound,
+                                             pattern = "_T[0-9][0-9]")),]
+# (3) Assign a new data name 
+data_entry = data_entry[, !duplicated(colnames(lc_tissue))]
+data_entry = data_entry %>% mutate(
+  patient_status = c(
+    "A-01_Surgery",
+    "A-01_Biopsy",
+    "O-01_Surgery",
+    "O-01_Biopsy",
+    "A-02_Surgery",
+    "A-02_Biopsy",
+    "A-03_Surgery",
+    "A-03_Biopsy",
+    "O-02_Surgery",
+    "O-02_Biopsy",
+    "A-04_Surgery",
+    "A-04_Biopsy",
+    "A-05_Surgery",
+    "A-05_Biopsy",
+    "A-06_Surgery",
+    "A-06_Biopsy",
+    "O-05_Surgery",
+    "O-05_Biopsy",
+    "A-07_Surgery",
+    "A-07_Biopsy"
+  )
+) %>% rowwise() %>% mutate(sample_type = ifelse(
+  grepl(compound, pattern = "Bx", ignore.case = T),
+  "Prior_treatment",
+  "Post_treatment"
+)) %>%
+  mutate(patient_num = str_extract(compound, pattern = "0[0-9][0-9]")) %>% filter(patient_num != "007") 
+
+
+# (3) Pre-treatment index
+pre_index = which(grepl(data_entry$compound,pattern = "Bx",ignore.case = T))
+# (4) Post-treatment index 
+post_index = which(!grepl(data_entry$compound,pattern = "Bx",ignore.case = T))
+```
+
+
+
+```{r colour}
+colour_m = data.frame(cbind(
+  colors = c(
+    "#00FFFF",
+    "#FF2400",
+    "#6A5ACD",
+    "#008080",
+    "#FFD700",
+    "#228B22",
+    "#4B0082",
+    "#90EE90",
+    "#FF7F50",
+    "#8F00FF"
+  ),
+  patient_num = c(
+    "001",
+    "003",
+    "004",
+    "005",
+    "006",
+    "007",
+    "008",
+    "009",
+    "011",
+    "012"
+  ),
+  patient_index = c(
+    "A-01",
+    "O-01",
+    "A-02",
+    "A-03",
+    "O-02",
+    "A-04",
+    "A-05",
+    "A-06",
+    "O-05",
+    "A-07"
+  )
+))
+
+colors_pat = c(
+  "#00FFFF",
+  "#FF2400",
+  "#6A5ACD",
+  "#008080",
+  "#FFD700",
+  "#228B22",
+  "#4B0082",
+  "#90EE90",
+  "#FF7F50",
+  "#8F00FF"
+)
+names(colors_pat) = c("001",
+                      "003",
+                      "004",
+                      "005",
+                      "006",
+                      "007",
+                      "008",
+                      "009",
+                      "011",
+                      "012")
+names(colors_pat) = c("A-01",
+                      "O-01",
+                      "A-02",
+                      "A-03",
+                      "O-02",
+                      "A-04",
+                      "A-05",
+                      "A-06",
+                      "O-05",
+                      "A-07")
+colour_new = rbind(
+  colour_m %>% mutate(patient_num = paste0(patient_num, "Biopsy")) %>% arrange(patient_index),
+  colour_m %>% mutate(patient_num = paste0(patient_num, "Surgery")) %>% arrange(patient_index)
+)
+colour_new = colour_new %>% mutate(num = str_extract(patient_num, pattern = "[0-9][0-9][0-9]")) %>% mutate(type =
+                                                                                                             sub("[0-9][0-9][0-9]", "", patient_num)) %>% group_by(patient_index) %>% arrange((type))
+```
+
+```{r pca}
+# (1) Transpose, replace colnames and remove the entry names
+pca_df = t(data_entry)
+row.names(pca_df) = colnames(data_entry)
+pca_df = na.omit(pca_df)
+colnames_pca_df = data_entry$compound
+pca_df = sapply(data.frame(pca_df[2:(ncol(data_entry) - 3), ]), as.numeric)
+colnames(pca_df) = str_extract(colnames_pca_df, pattern = "0[0-9][0-9]")
+
+# (2) Seperate the pre/post treatment groups
+#.Pre: pateint number vector
+pca_pre = pca_df[, pre_index]
+pre_pca = prcomp(pca_pre)
+biplot(pre_pca)
+# ggbiplot(pre_pca,
+#          circle = TRUE,
+#          varname.size = 3,
+#          varname.color = "red")  + xlim(-2, 3) + ylim(-1.5, 1.5)
+#.Pre: metabolites vector
+pre_pca2 = prcomp(t(pca_pre))
+ggplot(data = pre_pca2[["x"]], aes(
+  x = PC1,
+  y = PC2,
+  label = rownames(pre_pca2[["x"]])
+)) + geom_point() + geom_text_repel() + labs(
+  title = "PCA plot treating patient as variable - pre_treatment",
+  x = paste0("PC1", "(", format(round(
+    pre_pca2[["sdev"]][1] / sum(pre_pca2[["sdev"]]) * 100, 2
+  ), nsmall = 2), "%)"),
+  y = paste0("PC1", "(", format(round(
+    pre_pca2[["sdev"]][2] / sum(pre_pca2[["sdev"]]) * 100, 2
+  ), nsmall = 2), "%)")
+)
+#.post: pateint number vector
+pca_post = pca_df[, post_index]
+post_pca = prcomp(pca_post)
+biplot(post_pca)
+
+# ggbiplot(post_pca,
+#          circle = TRUE,
+#          varname.size = 3,
+#          varname.color = "red") + xlim(-2, 3) + ylim(-1.5, 1.5)
+#.post: metabolitesr vector
+post_pca2 = prcomp(t(pca_post))
+ggplot(data = post_pca2[["x"]], aes(
+  x = PC1,
+  y = PC2,
+  label = rownames(post_pca2[["x"]])
+)) + geom_point() + geom_text_repel() + labs(
+  title = "PCA plot treating patient as variable - post_treatment",
+  x = paste0("PC1", "(", format(round(
+    post_pca2[["sdev"]][1] / sum(post_pca2[["sdev"]]) * 100, 2
+  ), nsmall = 2), "%)"),
+  y = paste0("PC2", "(", format(round(
+    post_pca2[["sdev"]][2] / sum(post_pca2[["sdev"]]) * 100, 2
+  ), nsmall = 2), "%)")
+)
+
+
+
+#(3) Combined PCA
+pca_df_combined = pca_df
+tissue_type = c()
+tissue_type[pre_index] = "Pre_treatment"
+tissue_type[post_index] = "Post_treatment"
+colnames(pca_df_combined) = paste0(tissue_type,
+                                   "_",
+                                   str_extract(colnames_pca_df, pattern = "0[0-9][0-9]"))
+#run PCA
+pca_combined = prcomp(t(pca_df_combined))
+#plot
+pca_c_df = data.frame(pca_combined[["x"]][, 1:2]) %>% mutate(treatment_id = rownames(.))
+pca_c_df$treatment_type <- ifelse(grepl("^Pre", pca_c_df$treatment_id), "Pre", "Post")
+pca_c_df$patient_num = str_extract(pca_c_df$treatment_id, pattern = "0[0-9][0-9]")
+pca_c_df = merge(pca_c_df, colour_m, by = "patient_num")
+# Plot PC1 vs PC2
+colours = pca_c_df$colors
+arrow_style <- arrow(length = unit(0.75, "picas"),
+                     type = "closed",
+                     angle = 25)
+names(colours) = pca_c_df$patient_num
+# Compute segments data
+segments_data = data.frame(sapply(data.frame(
+  cbind(
+    x = pca_c_df$PC1[which(pca_c_df$treatment_type == "Pre")],
+    y = pca_c_df$PC2[which(pca_c_df$treatment_type == "Pre")],
+    xend = pca_c_df$PC1[which(pca_c_df$treatment_type == "Post")],
+    yend = pca_c_df$PC2[which(pca_c_df$treatment_type == "Post")]
+  )
+), as.numeric)) %>% mutate(color = pca_c_df$colors[which(pca_c_df$treatment_type == "Pre")])
+
+
+ggplot(pca_c_df,
+       aes(
+         x = PC1,
+         y = PC2,
+         label = treatment_id,
+         colour = patient_num
+       )) +
+  geom_point(size = 2) +
+  scale_color_manual(values = colours) +
+  # stat_ellipse(level = 0.8, data = pca_c_df[which(pca_c_df$treatment_type == "Post"),], aes(x = PC1, y = PC2), inherit.aes = F)+
+  # stat_ellipse(level = 0.8,data = pca_c_df[which(pca_c_df$treatment_type == "Pre"),], aes(x = PC1, y = PC2), inherit.aes = F)+
+  #geom_text_repel() +  # Use ggrepel for repelling labels
+  theme_minimal() + labs(
+    title = "PCA plot treating patient as variable - combined_pre_post",
+    x = paste0("PC1", "(", format(
+      round(pca_combined[["sdev"]][1] / sum(pca_combined[["sdev"]]) * 100, 2), nsmall = 2
+    ), "%)"),
+    y = paste0("PC1", "(", format(
+      round(pca_combined[["sdev"]][2] / sum(pca_combined[["sdev"]]) * 100, 2), nsmall = 2
+    ), "%)")
+  ) + geom_segment(
+    data = segments_data,
+    aes(
+      x = x,
+      y = y,
+      xend = xend,
+      yend = yend
+    ),
+    color = segments_data$color,
+    arrow = arrow_style,
+    linewidth = 0.5,
+    inherit.aes = F
+  )
+
+#. 3D plotly
+library(plotly)
+library(dplyr)
+
+# Assuming pca_c_df and colours are defined as in your original ggplot code
+pca_c_df_3d = pca_c_df %>% mutate(PC3 = pca_combined[["x"]][, 3])
+# Filter data for "Pre" and "Post" treatments
+pre_data_3d <- pca_c_df_3d %>% filter(treatment_type == "Pre")
+post_data_3d <- pca_c_df_3d %>% filter(treatment_type == "Post")
+
+# Create segments data for 3D plot
+segments_data <- data.frame(
+  x = pre_data_3d$PC1,
+  y = pre_data_3d$PC2,
+  z = pre_data_3d$PC3,
+  # Replace PC3 with your actual third dimension
+  xend = post_data_3d$PC1,
+  yend = post_data_3d$PC2,
+  zend = post_data_3d$PC3,
+  # Replace PC3 with your actual third dimension
+  color =  pre_data_3d$colors  # Assuming colors are defined in pca_c_df
+)
+
+# Create Plotly plot
+p = plot_ly() %>%
+  add_trace(
+    type = "scatter3d",
+    mode = "markers",
+    x = pca_c_df_3d$PC1,
+    y = pca_c_df_3d$PC2,
+    z = pca_c_df_3d$PC3,
+    # Replace PC3 with your actual third dimension
+    color = pca_c_df_3d$patient_num,
+    # Color by patient number
+    colors = colours,
+    # Defined earlier
+    marker = list(size = 5),
+    text = pca_c_df$treatment_id,
+    # Tooltip text
+    hoverinfo = "text"
+  )
+
+for (j in 1:nrow(segments_data)) {
+  dir_vec <- c(
+    segments_data$xend[j] - segments_data$x[j],
+    segments_data$yend[j] - segments_data$y[j],
+    segments_data$zend[j],
+    segments_data$z[j]
+  )
+  dir_vec <- dir_vec / sqrt(sum(dir_vec ^ 2))
+  p = p %>%
+    add_trace(
+      type = "scatter3d",
+      mode = "lines",
+      x = c(segments_data$x[j], segments_data$xend[j]),
+      y = c(segments_data$y[j], segments_data$yend[j]),
+      z = c(segments_data$z[j], segments_data$zend[j]),
+      line = list(color = segments_data$color[j], width = 1),
+      hoverinfo = "none"
+    ) %>%
+    add_trace(
+      type = "cone",
+      x = segments_data$xend[j],
+      y = segments_data$yend[j],
+      z = segments_data$zend[j],
+      u = dir_vec[1],
+      v = dir_vec[2],
+      w = dir_vec[3],
+      sizemode = "absolute",
+      sizeref = 0.5,
+      showscale = FALSE,
+      colorscale = segments_data$color[j],
+      anchor = "tail"
+    )
+}
+
+p = p %>%
+  layout(title = "PCA Plot with Pre and Post Treatment",
+         scene = list(
+           xaxis = list(title = paste0("PC1 (", format(
+             round(pca_combined$sdev[1] / sum(pca_combined$sdev) * 100, 2), nsmall = 2
+           ), "%)")),
+           yaxis = list(title = paste0("PC2 (", format(
+             round(pca_combined$sdev[2] / sum(pca_combined$sdev) * 100, 2), nsmall = 2
+           ), "%)")),
+           zaxis = list(title = paste0("PC3 (", format(
+             round(pca_combined$sdev[3] / sum(pca_combined$sdev) * 100, 2), nsmall = 2
+           ), "%)"))
+         ))
+p
+```
+
+
+
+```{r helperfunctions}
+convert_xlsx_to_plotdf = function(xlsx_data) {
+  raw_df = reshape2::melt(xlsx_data) %>% mutate(patientnum = str_extract(compound, pattern = "0[0-9][0-9]")) %>%
+    mutate(status = ifelse(grepl(compound, pattern = "Bx"), "Biopsy", "Surgery")) %>%
+    mutate(metabolites = sub("_HMDB.*$", "", variable))
+  
+  plot_df = data.frame()
+  for (i in 1:length(unique(raw_df$metabolites))) {
+    metabolite = unique(raw_df$metabolites)[i]
+    sub_df = raw_df[which(raw_df$metabolites == metabolite), ]
+    sub_df_biopsy = sub_df[which(sub_df$status == "Biopsy"), ]
+    sub_df_srugery = sub_df[which(sub_df$status == "Surgery"), ]
+    merged_surgery_biopsy = merge(sub_df_biopsy, sub_df_srugery, by = "patientnum")
+    if (any(is.na(
+      c(
+        merged_surgery_biopsy$value.x,
+        merged_surgery_biopsy$value.y
+      )
+    ))) {
+      next
+    }
+    plot_df = rbind(plot_df, merged_surgery_biopsy)
+  }
+  return(plot_df)
+}
+# unfiltered_table = combined_lc_tissue_data
+filter_against_non_significant_metabolures = function(unfiltered_table, all_info = F) {
+  unique_met = unique(unfiltered_table$metabolites.x)
+  return_table = data.frame()
+  for (i in 1:length(unique_met)) {
+    sub_table = unfiltered_table[which(unfiltered_table$metabolites.x == unique_met[i]), ]
+    test = t.test(
+      as.numeric(sub_table$value.x),
+      as.numeric(sub_table$value.y),
+      paired = TRUE,
+      alternative = "two.sided",
+      na.action = na.omit
+    )
+    
+    if (test$p.value <= 0.05) {
+      return_sub = sub_table %>% mutate(p_val = test$p.value) %>%
+        mutate(expected_diff = test$estimate)
+      return_table = rbind(return_table, return_sub)
+    } else if (all_info == T) {
+      return_sub = sub_table %>% mutate(p_val = test$p.value) %>%
+        mutate(expected_diff = test$estimate)
+      return_table = rbind(return_table, return_sub)
+    } else{
+      next
+    }
+  }
+  return(return_table)
+}
+##### Plot
+disassemble_data = function(combined_data) {
+  replicated_colname = gsub("\\.[xy]$", "", colnames(combined_data))
+  index_replicated = which(duplicated(replicated_colname))
+  name_non_replicated = unique(replicated_colname)[which(!unique(replicated_colname) %in% replicated_colname[index_replicated])]
+  index_non_replicated = c(1:ncol(combined_data))[-c(which(replicated_colname %in% name_non_replicated),
+                                                     index_replicated)]
+  patient_surgery = cbind(combined_data[, which(replicated_colname %in% name_non_replicated)], combined_data[, index_replicated])
+  colnames(patient_surgery) = gsub("\\.[xy]$", "", colnames(patient_surgery))
+  #
+  patient_biopsy = cbind(combined_data[, which(replicated_colname %in% name_non_replicated)], combined_data[, index_non_replicated])
+  colnames(patient_biopsy) = gsub("\\.[xy]$", "", colnames(patient_biopsy))
+  
+  return_df = rbind(patient_surgery, patient_biopsy)
+  return(return_df)
+}
+```
+
+
+```{r heatmap}
+# (1) Some data opearation to transform the format of the data
+heatmap_df = data_entry
+colnames(heatmap_df)[2:ncol(data_entry)] = sub("_HMDB.*", "", sub("-[0-9]?[a-z]?TMS.*", "", paste0(colnames(heatmap_df)[2:ncol(data_entry)])))
+View(heatmap_df)
+heatmap_df[, 2:(ncol(heatmap_df) - 3)] = sapply(heatmap_df[, 2:(ncol(heatmap_df) -
+                                                                  3)], as.numeric)
+# (2) Utilised the function to convert the original dataframe into a plotable dataframe.
+heatmap_plotdf = convert_xlsx_to_plotdf(as.data.frame(heatmap_df)[, -c(ncol(heatmap_df) -
+                                                                         1, ncol(heatmap_df))])
+# (3) Cleaned against non-significant metabolites
+heatmap_lc_tissue = filter_against_non_significant_metabolures(heatmap_plotdf , all_info = T) %>% mutate(variable.x = sub("X", "", variable.x, fixed = TRUE)) %>% mutate(variable.y = sub("X", "", variable.y, fixed = TRUE))
+heatmap_lc_tissue  = heatmap_lc_tissue  %>% rowwise() %>% mutate(regulation = ifelse(expected_diff <=
+                                                                                       0, "Up", "Down")) %>% mutate(regulation = ifelse(p_val > 0.05, "non-significant", regulation))
+de_df = unique(heatmap_lc_tissue[, c(10, 14, 16)] %>% arrange(p_val))
+xlsx::write.xlsx(de_df, file = "~/anheart/LC_MS_DE_metabolites_ttest.xlsx", row.names = T)
+
+disassembled_lc_t = disassemble_data(heatmap_lc_tissue) %>% mutate("Patient_sample" = paste0(patientnum, status)) %>%
+  mutate(metabolites = sub("X", "", metabolites)) %>% rowwise() %>%
+  mutate(colours = colour_m$colors[which(colour_m$patient_num == patientnum)]) %>% filter(p_val <= 0.05)
+
+disassembled_lc_tissue = data.frame()
+for (i in 1:length(unique(disassembled_lc_t$metabolites))) {
+  subdt = disassembled_lc_t[which(disassembled_lc_t$metabolites == unique(disassembled_lc_t$metabolites)[i]), ]
+  subdt =  cbind(subdt, z_score = scale(subdt$value))
+  disassembled_lc_tissue = rbind(disassembled_lc_tissue, subdt)
+}
+
+disassembled_lc_tissue = disassembled_lc_tissue %>% mutate(Patient_sample = with(disassembled_lc_tissue, paste0(patientnum, status)))
+############################################
+############  Filter the p-value ##########
+############################################
+disassembled_lc_tissue = disassembled_lc_tissue %>% filter(p_val <= 0.05)
+
+plot_matrix = reshape2::acast(data.frame(with(
+  disassembled_lc_tissue,
+  cbind(
+    z_score = as.numeric(z_score),
+    Patient_sample = patient_status,
+    metabolites = metabolites
+  )
+)),
+formula = `metabolites` ~ `Patient_sample`,
+value.var = "z_score")
+plot_matrix = na.omit(plot_matrix)
+View(plot_matrix)
+sample_names <- colnames(as.data.frame(plot_matrix))
+colour_new_sub = colour_new[which(!grepl(colour_new$patient_num, pattern =
+                                           "007")), ]
+plot_matrix = plot_matrix[, c(unlist(lapply(paste0(colour_new_sub$patient_index, "_", colour_new$type), function(x) {
+  which(colnames(plot_matrix) %in% x)
+})))]
+
+######################################################
+####################omit NAs##########################
+######################################################
+full_dend <- as.dendrogram(hclust(dist(na.omit(plot_matrix))))
+sample_dend <- as.dendrogram(hclust(dist(na.omit(t(
+  plot_matrix
+)))))
+
+# Cut the dendrogram
+depth_cutoff <- 5
+h_c_cut <- cut(full_dend, h = depth_cutoff)
+dend_cut <- hang.dendrogram(as.dendrogram(h_c_cut$upper))
+# Forplot_matrix to extend the branches (optional)
+dend_cut <- hang.dendrogram(dend_cut, hang = -1)
+dend_data_cut <- dendro_data(dend_cut)
+
+# Cut the dendrogram
+depth_cutoff2 <- 5
+h_c_cut2 <- cut(sample_dend, h = depth_cutoff2)
+dend_cut2 <- hang.dendrogram(as.dendrogram(h_c_cut2$upper))
+# Forplot_matrix to extend the branches (optional)
+dend_cut2 <- hang.dendrogram(dend_cut2, hang = -1)
+dend_data_cut2 <- dendro_data(dend_cut2)
+
+
+# Extract the names assigned to the clusters (e.g., "Branch 1", "Branch 2", ...)
+cluster_names <- as.character(dend_data_cut$labels$label)
+cluster_names2 <- as.character(dend_data_cut2$labels$label)
+# Extract the names of the haplotypes that belong to each group (using
+# the 'labels' function)
+lst_genes_in_clusters <- h_c_cut$lower %>%
+  lapply(labels) %>%
+  setNames(cluster_names)
+
+lst_genes_in_clusters2 <- h_c_cut2$lower %>%
+  lapply(labels) %>%
+  setNames(cluster_names2)
+
+# Setup the data, so that the layout is inverted (this is more
+# "clear" than simply using coord_flip())
+segment_data <- with(segment(dend_data_cut),
+                     data.frame(
+                       x = y,
+                       y = x,
+                       xend = yend,
+                       yend = xend
+                     ))
+
+# Extract the positions of the clusters (by getting the positions of the
+# leafs); data is already in the same order as in the cluster name
+cluster_positions <- segment_data[segment_data$xend == 0, "y"]
+cluster_pos_table <- data.frame(y_position = cluster_positions, cluster = cluster_names)
+
+# Specify the positions for the genes, accounting for the clusters
+gene_pos_table <- lst_genes_in_clusters %>%
+  ldply(function(ss)
+    data.frame(gene = ss), .id = "cluster") %>%
+  mutate(y_center = 1:nrow(.), height = 1)
+
+sample_pos_table <- lst_genes_in_clusters2 %>%
+  ldply(function(ss)
+    data.frame(gene = ss), .id = "cluster") %>%
+  mutate(y_center = 1:nrow(.), height = 1)
+# > head(gene_pos_table, 3)
+#    cluster gene y_center height
+# 1 Branch 1  g11        1      1
+# 2 Branch 1  g20        2      1
+# 3 Branch 1  g12        3      1
+
+# Table to position the samples
+sample_pos_table <- data.frame(sample = sample_names) %>%
+  mutate(x_center = 1:nrow(.), width = 1)
+# If groupd by patient status
+sample_pos_table$sample = c(
+  "001Biopsy",
+  "003Biopsy",
+  "004Biopsy",
+  "005Biopsy",
+  "006Biopsy",
+  "008Biopsy",
+  "009Biopsy",
+  "011Biopsy",
+  "012Biopsy",
+  "001Surgery",
+  "003Surgery",
+  "004Surgery",
+  "005Surgery",
+  "006Surgery",
+  "008Surgery",
+  "009Surgery",
+  "011Surgery",
+  "012Surgery"
+)
+
+
+
+sample_pos_table$sample = paste0(colour_new_sub$patient_index, "_", colour_new_sub$type)
+
+
+# Coordinates for plotting rectangles delimiting the clusters: aggregate
+# over the positions of the genes in each cluster
+cluster_delim_table <- gene_pos_table %>%
+  group_by(cluster) %>%
+  dplyr::summarize(y_min = min(y_center - 0.5 * height),
+                   y_max = max(y_center + 0.5 * height)) %>%
+  as.data.frame() %>%
+  mutate(
+    x_min = with(sample_pos_table, min(x_center - 0.5 * width)),
+    x_max = with(sample_pos_table, max(x_center + 0.5 * width))
+  )
+
+# Neglecting the gap parameters
+heatmap_data <- plot_matrix %>%
+  reshape2::melt(value.name = "expr", varnames = c("gene", "sample")) %>%
+  left_join(gene_pos_table) %>%
+  left_join(sample_pos_table)
+
+# Limits for the vertical axes (genes / clusters)
+gene_axis_limits <- with(gene_pos_table, c(min(y_center - 0.5 * height), max(y_center + 0.5 * height))) +
+  0.1 * c(-1, 1) # extra spacing: 0.1
+
+# Heatmap plot
+heatmap_data$expr = as.numeric(heatmap_data$expr)
+sample_names2 = sample_names
+x_center_new = c()
+for (i in 1:length(heatmap_data$sample)) {
+  x_center_new = c(x_center_new, as.numeric(which(
+    sample_names2 %in% heatmap_data$sample[i]
+  )))
+}
+heatmap_data = heatmap_data %>% mutate(x_center = x_center_new)
+#heatmap_data = heatmap_data %>% filter(expr>=quantile(heatmap_data$expr,0.75) | expr>=quantile(heatmap_data$expr,0.25) )
+colour_new = rbind(
+  colour_m[1:9, ] %>% mutate(patient_num = paste0(patient_num, "Biopsy")) %>% arrange(patient_index),
+  colour_m[1:9, ] %>% mutate(patient_num = paste0(patient_num, "Surgery")) %>% arrange(patient_index)
+)
+
+
+pateint_define_table = data.frame(
+  x_min = c(0.5, 6.5, 9.5, 15.5),
+  x_max = c(6.5, 9.5, 15.5, 18.5),
+  y_min = rep(0.5, times = 4),
+  y_max = rep(max(cluster_delim_table$y_max), times = 4)
+)
+
+heatmap_data = heatmap_data %>% rowwise() %>% mutate(x_center = sample_pos_table$x_center[which(sample_pos_table$sample %in% sample)])
+plt_hmap <- ggplot(
+  heatmap_data,
+  aes(
+    x = x_center,
+    y = y_center,
+    fill = as.numeric(expr),
+    height = height,
+    width = width
+  )
+) +
+  geom_tile() +
+  geom_rect(
+    data = pateint_define_table,
+    aes(
+      xmin = x_min,
+      xmax = x_max,
+      ymin = y_min,
+      ymax = y_max
+    ),
+    fill = NA,
+    colour = "black",
+    inherit.aes = FALSE
+  ) +
+  geom_rect(
+    data = cluster_delim_table,
+    aes(
+      xmin = x_min,
+      xmax = x_max,
+      ymin = y_min,
+      ymax = y_max
+    ),
+    fill = NA,
+    colour = "black",
+    inherit.aes = FALSE
+  ) +
+  scale_fill_gradient2("expr", high = "red", low = "blue") +
+  scale_x_continuous(
+    breaks = sample_pos_table$x_center,
+    labels = sample_pos_table$sample,
+    expand = c(0.01, 0.01)
+  ) +
+  scale_y_continuous(
+    breaks = gene_pos_table$y_center,
+    labels = gene_pos_table$gene,
+    limits = gene_axis_limits,
+    expand = c(0, 0),
+    position = "right"
+  ) +
+  labs(x = "Sample", y = "") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(
+      size = rel(1),
+      hjust = 1,
+      angle = 45
+    ),
+    # margin: top, right, bottom, and left
+    plot.margin = unit(c(1, 0.2, 0.2, -0.1), "cm"),
+    panel.grid.minor = element_blank()
+  ) + theme(axis.text.x = element_text(colour = colour_new$colors)) +
+  theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+plt_hmap
+# Dendrogram plot
+plt_dendr <- ggplot(segment_data) +
+  geom_segment(aes(
+    x = x / 2,
+    y = y,
+    xend = xend / 2,
+    yend = yend
+  )) +
+  scale_x_reverse(expand = c(0, 0.5)) +
+  scale_y_continuous(
+    breaks = cluster_pos_table$y_position,
+    labels = cluster_pos_table$cluster,
+    limits = gene_axis_limits,
+    expand = c(0, 0)
+  ) +
+  labs(
+    x = "Distance",
+    y = "",
+    colour = "",
+    size = ""
+  ) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank()) +
+  theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+
+patient_segment_data = data.frame(
+  x = c(3.5, 3.5, 9.5, 14, 14, 17),
+  y = c(1, 4, 4, 1, 4, 4),
+  xend = c(3.5, 9.5, 9.5, 14, 17, 17),
+  yend = c(4, 4, 1, 4, 4, 1)
+)
+
+
+plt_pat_dendr <- ggplot(patient_segment_data) +
+  geom_segment(aes(
+    x = x ,
+    y = y,
+    xend = xend,
+    yend = yend
+  )) + scale_x_continuous(limits = c(0, 18.5)) +
+  scale_y_continuous(breaks = c(4),
+                     limits = c(0, 5),
+                     expand = c(0, 0)) +
+  labs(
+    x = "",
+    y = "",
+    colour = "",
+    size = ""
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.text.y = element_blank()
+  ) + annotate(
+    geom = "text",
+    label = "Astro \n Pre-treatment",
+    x = 3.5,
+    y = 4.5,
+    size = rel(2.5)
+  ) +
+  annotate(
+    geom = "text",
+    label = "Astro \n Post-treatment",
+    x = 9.5,
+    y = 4.5,
+    size = rel(2.5)
+  ) +
+  annotate(
+    geom = "text",
+    label = "Oligo \n Pre-treatment",
+    x = 14,
+    y = 4.5,
+    size = rel(2.5)
+  ) +
+  annotate(
+    geom = "text",
+    label = "Oligo \n Post-treatment",
+    x = 17,
+    y = 4.5,
+    size = rel(2.5)
+  ) +
+  theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+# plt_dendr_sample <- ggplot(segment_data_sample) +
+#   geom_segment(aes(x = x/2, y = y, xend = xend/2, yend = yend)) +
+#   scale_x_reverse(expand = c(0, 0.5)) +
+#   scale_y_continuous(breaks = cluster_pos_table$y_position,
+#                      labels = cluster_pos_table$cluster,
+#                      limits = gene_axis_limits,
+#                      expand = c(0, 0)) +
+#   labs(x = "Distance", y = "", colour = "", size = "") +
+#   theme_bw() +
+#   theme(panel.grid.minor = element_blank(),
+#       panel.grid.major.x = element_blank())
+
+
+
+library(ggpubr)
+ggarrange(
+  plt_dendr,
+  plt_hmap,
+  nrow = 1,
+  align = "h",
+  widths = c(1, 4)
+)
+
+ggarrange(
+  ggarrange(
+    NULL,
+    plt_dendr,
+    NULL,
+    nrow = 3,
+    align = "v",
+    heights = c(1.1, 4, 0.38)
+  ),
+  ggarrange(
+    plt_pat_dendr,
+    plt_hmap,
+    nrow = 2,
+    align = "v",
+    heights = c(1, 4)
+  ),
+  ncol = 2,
+  widths = c(1, 4)
+)
+
+
+
+#svglite::svglite("~/Desktop/Offline_dir/LC_heatmap_updated.svg")
+ggarrange(
+  plt_dendr,
+  plt_hmap,
+  nrow = 1,
+  align = "h",
+  widths = c(1, 4)
+)
+#dev.off()
+```
+
+
+```{r waterfall_lc}
+#####################################################################################
+################################# Updated barplot####################################
+# Load necessary libraries
+library(ggplot2)
+library(dplyr)
+
+# Sample data
+set.seed(123)
+# patientnum                                              compound.x                         variable.x  value.x status.x
+# 1           001        JW546_T1_218_001_Bx_T_Bio_A_UNK-0011_27062023_11 2.Hydroxyglutaric.acid_HMDB0000694 27881128   Biopsy
+# 2           003 JW546_T7_218_003_Bx_T_Bio_A_rerun1_UNK-0033_29062023_33 2.Hydroxyglutaric.acid_HMDB0000694 11132735   Biopsy
+# 3           004        JW546_T5_218_004_Bx_T_Bio_A_UNK-0017_27062023_17 2.Hydroxyglutaric.acid_HMDB0000694 25189630   Biopsy
+# 4           005        JW546_T7_218_005_Bx_T_Bio_A_UNK-0012_27062023_12 2.Hydroxyglutaric.acid_HMDB0000694  8183243   Biopsy
+# 2010        006        SB704_T1_218-006_Bx_T_Bio_A_UNK-0046_19102023_45 2.Hydroxyglutaric.acid_HMDB0000694 21531114   Biopsy
+# 2011        007        SB704_T3_218-007_Bx_T_Bio_A_UNK-0043_19102023_42 2.Hydroxyglutaric.acid_HMDB0000694  4185906   Biopsy
+# metabolites.x                                       compound.y                         variable.y  value.y status.y
+# 1    X2.Hydroxyglutaric.acid  JW546_T2_218_001_04_T_Bio_A_UNK-0009_27062023_9 2.Hydroxyglutaric.acid_HMDB0000694  4356066  Surgery
+# 2    X2.Hydroxyglutaric.acid JW546_T4_218_003_04_T_Bio_A_UNK-0016_27062023_16 2.Hydroxyglutaric.acid_HMDB0000694  1211523  Surgery
+# 3    X2.Hydroxyglutaric.acid JW546_T6_218_004_04_T_Bio_A_UNK-0018_27062023_18 2.Hydroxyglutaric.acid_HMDB0000694 10992608  Surgery
+# 4    X2.Hydroxyglutaric.acid JW546_T8_218_005_04_T_Bio_A_UNK-0015_27062023_15 2.Hydroxyglutaric.acid_HMDB0000694  1930136  Surgery
+# 2010 X2.Hydroxyglutaric.acid SB704_T2_218-006_04_T_Bio_A_UNK-0042_19102023_41 2.Hydroxyglutaric.acid_HMDB0000694 17415818  Surgery
+# 2011 X2.Hydroxyglutaric.acid SB704_T4_218-007_04_T_Bio_A_UNK-0045_19102023_44 2.Hydroxyglutaric.acid_HMDB0000694  2932066  Surgery
+# metabolites.y      p_val expected_diff
+# 1    X2.Hydroxyglutaric.acid 0.01393691      11985401
+# 2    X2.Hydroxyglutaric.acid 0.01393691      11985401
+# 3    X2.Hydroxyglutaric.acid 0.01393691      11985401
+# 4    X2.Hydroxyglutaric.acid 0.01393691      11985401
+# 2010 X2.Hydroxyglutaric.acid 0.01393691      11985401
+# 2011 X2.Hydroxyglutaric.acid 0.01393691      11985401
+heatmap_df = data_entry
+colnames(heatmap_df)[2:ncol(data_entry)] = sub("_HMDB.*", "", sub("-[0-9]?[a-z]?TMS.*", "", paste0(colnames(heatmap_df)[2:ncol(data_entry)])))
+View(heatmap_df)
+heatmap_df[, 2:ncol(heatmap_df)] = sapply(heatmap_df[, 2:ncol(heatmap_df)], as.numeric)
+standard_clean_lc = data.frame()
+heatmap_plotdf = convert_xlsx_to_plotdf(as.data.frame(heatmap_df)[, -c(ncol(heatmap_df) -
+                                                                         1, ncol(heatmap_df))])
+# (3) Cleaned against non-significant metabolites
+clean_lc_tissue = filter_against_non_significant_metabolures(heatmap_plotdf , all_info = T) %>% mutate(variable.x = sub("X", "", variable.x, fixed = TRUE)) %>% mutate(variable.y = sub("X", "", variable.y, fixed = TRUE))
+
+clean_lc_tissue = clean_lc_tissue %>% mutate(diff = value.y - value.x)
+clean_lc_tissue$variable.x = sub("_*.", "", clean_lc_tissue$variable.x)
+clean_lc_tissue$variable.y = sub("_*.", "", clean_lc_tissue$variable.y)
+
+for (i in 1:length(unique(clean_lc_tissue$metabolites.x))) {
+  subdt = clean_lc_tissue[which(clean_lc_tissue$metabolites.x == unique(clean_lc_tissue$metabolites.x)[i]), ]
+  subdt =  cbind(subdt, z_score = scale(subdt$diff))
+  standard_clean_lc  = rbind(standard_clean_lc , subdt)
+}
+
+standard_clean_lc$value.x = abs(standard_clean_lc$value.x)
+standard_clean_lc$value.y = abs(standard_clean_lc$value.y)
+standard_clean_lc$metabolites.x = sub("X", "", standard_clean_lc$metabolites.x)
+standard_clean_lc =  standard_clean_lc %>% mutate(log_diff = log(value.y+1) -
+                                                    log(value.x+1))
+# Get top/down 25
+standard_clean_lc  = standard_clean_lc %>% filter(expected_diff >= sort(unique(standard_clean_lc$expected_diff))[length(unique(standard_clean_lc$expected_diff)) - 13] |
+                                                    expected_diff <= sort(unique(standard_clean_lc$expected_diff))[13])
+
+
+# Calculate summary statistics
+colors_pat2 = c(
+  "#00FFFF",
+  "#FF2400",
+  "#6A5ACD",
+  "#008080",
+  "#FFD700",
+  "#228B22",
+  "#4B0082",
+  "#90EE90",
+  "#FF7F50",
+  "#8F00FF"
+)
+names(colors_pat2) = c("001",
+                       "003",
+                       "004",
+                       "005",
+                       "006",
+                       "007",
+                       "008",
+                       "009",
+                       "011",
+                       "012")
+standard_clean_lc = standard_clean_lc %>% arrange(desc(log_diff))
+# standard_clean_lc = standard_clean_lc[which(standard_clean_lc$metabolites.x !=
+#                                               "D.Lactic.acid"), ]
+summary_data <- standard_clean_lc %>%
+  group_by(metabolites.x) %>%
+  dplyr::summarize(
+    mean = mean(log_diff),
+    se = sd(log_diff) / sqrt(n()),
+    colour = ifelse(mean(log_diff) >= 0, "red", "blue")
+  )
+summary_data= unique(summary_data)
+summary_data$metabolites.x <- factor(summary_data$metabolites.x, levels = summary_data$metabolites.x)
+# Plot the bar plot with error bars
+ggplot(standard_clean_lc, aes(x = metabolites.x, y = log_diff)) +
+  geom_bar(
+    data = summary_data,
+    aes(
+      x = reorder(metabolites.x, -mean),
+      y = mean,
+      fill = ifelse(mean >= 0, "Increased after treatment", "Reduced after treatment")
+    ),
+    stat = "identity",
+    position = position_dodge(),
+    width = 0.7
+  ) + scale_fill_manual(
+    values = c(
+      "Increased after treatment" = "red",
+      "Reduced after treatment" = "blue"
+    ),
+    name = "Regulatory direction"
+  ) +  geom_point(aes(colour = patientnum)) + scale_colour_manual(values = colors_pat2) +
+  theme(axis.text.x = element_text(
+    angle = 90,
+    vjust = 0.5,
+    hjust = 1
+  )) +
+  geom_errorbar(
+    data = summary_data,
+    aes(
+      x = metabolites.x,
+      y = mean,
+      ymin = mean - se,
+      ymax = mean + se
+    ),
+    width = 0.2,
+    position = position_dodge(0.7)
+  ) +
+  labs(x = "Metabolites", y = "logFC", title = "LC-MS water fall plot") +
+  theme(panel.background = element_blank(),
+        panel.grid.minor.x =  element_blank()) + coord_flip() + ylim(min(standard_clean_lc$log_diff),
+                                                                     max(standard_clean_lc$log_diff))
+
+
+#ggsave("~/Desktop/Offline_dir/anheart/lc_ms_waterfall.svg")
+```
+
+```{r volcanoplot}
+disassembled_lc_tissue = data.frame()
+for (i in 1:length(unique(disassembled_lc_t$metabolites))) {
+  subdt = disassembled_lc_t[which(disassembled_lc_t$metabolites == unique(disassembled_lc_t$metabolites)[i]), ]
+  subdt =  cbind(subdt, z_score = scale(subdt$value))
+  disassembled_lc_tissue = rbind(disassembled_lc_tissue, subdt)
+}
+
+disassembled_lc_tissue = disassembled_lc_tissue %>% mutate(Patient_sample = with(disassembled_lc_tissue, paste0(patientnum, status)))
+
+heatmap_df = data_entry
+colnames(heatmap_df)[2:ncol(data_entry)] = sub("_HMDB.*", "", sub("-[0-9]?[a-z]?TMS.*", "", paste0(colnames(heatmap_df)[2:ncol(data_entry)])))
+View(heatmap_df)
+heatmap_df[, 2:ncol(heatmap_df)] = sapply(heatmap_df[, 2:ncol(heatmap_df)], as.numeric)
+
+colnames(heatmap_df)[2:(ncol(heatmap_df)-3)] = colnames(lc_tissue)[2:ncol(lc_tissue)]
+heatmap_plotdf = convert_xlsx_to_plotdf(as.data.frame(heatmap_df)[, -c(ncol(heatmap_df) -
+                                                                         1, ncol(heatmap_df))])
+
+
+# (3) Cleaned against non-significant metabolites
+clean_lc_tissue = filter_against_non_significant_metabolures(heatmap_plotdf , all_info = T) %>% mutate(variable.x = sub("X", "", variable.x, fixed = TRUE)) %>% mutate(variable.y = sub("X", "", variable.y, fixed = TRUE))
+
+clean_lc_tissue = clean_lc_tissue %>% mutate(diff = value.y - value.x)
+clean_lc_tissue$variable.x = sub(".*_", "", clean_lc_tissue$variable.x)
+clean_lc_tissue$variable.y = sub(".*_", "", clean_lc_tissue$variable.y)
+standard_clean_lc = data.frame()
+for (i in 1:length(unique(clean_lc_tissue$metabolites.x))) {
+  subdt = clean_lc_tissue[which(clean_lc_tissue$metabolites.x == unique(clean_lc_tissue$metabolites.x)[i]), ]
+  subdt =  cbind(subdt, z_score = scale(subdt$diff))
+  standard_clean_lc  = rbind(standard_clean_lc , subdt)
+}
+
+standard_clean_lc$value.x = abs(standard_clean_lc$value.x)
+standard_clean_lc$value.y = abs(standard_clean_lc$value.y)
+#standard_clean_lc$metabolites.x = sub("X", "", standard_clean_lc$metabolites.x)
+standard_clean_lc =  standard_clean_lc %>% mutate(log_diff = log(value.y+1) -
+                                                    log(value.x+1))
+
+############################################
+############  Filter the p-value ##########
+############################################
+data_table = disassembled_lc_tissue
+###################### voccano plot
+library(ggrepel)
+# plot adding up all layers we have seen so far
+
+patient_met_fc = data.frame()
+for(i in 1:length(unique(data_table$patientnum))){
+  temp_surgery = data_table[which(data_table$patientnum == unique(data_table$patientnum)[i] &
+                                    data_table$status == "Surgery"),]
+  temp_biopsy = data_table[which(data_table$patientnum == unique(data_table$patientnum)[i] &
+                                   data_table$status == "Biopsy"),]
+  tem_horizontal_combined = merge(temp_surgery,temp_biopsy, by = "metabolites") %>% mutate(fc = log(value.x/value.y))
+  
+  temp_df = cbind( metabolites = tem_horizontal_combined$metabolites,
+                   logfc = tem_horizontal_combined$fc,
+                   pval = tem_horizontal_combined$p_val.x,
+                   patientnum = rep(unique(data_table$patientnum)[i],
+                                    times = nrow(tem_horizontal_combined)))
+  patient_met_fc = rbind(patient_met_fc,
+                         temp_df)
+  
+}
+
+ggplot(data=patient_met_fc, aes(x=as.numeric(logfc), y=-log10(as.numeric(pval)))) +
+  geom_point() + 
+  theme_minimal() +
+  scale_color_manual(values=c("blue", "black", "red")) +
+  geom_vline(xintercept=c(-0.6, 0.6), col="red") +
+  geom_hline(yintercept=-log10(0.05), col="red")
+
+keep_first_label <- function(labels) {
+  seen_labels <- vector()
+  result <- vector()
+  for (label in labels) {
+    if (label %in% seen_labels) {
+      result <- c(result, NA)
+    } else {
+      seen_labels <- c(seen_labels, label)
+      result <- c(result, label)
+    }
+  }
+  return(result)
+}
+
+# Filter the metabolomics data by p-value <= 0.05
+filtered_patient_met_fc = patient_met_fc %>% filter(pval <=0.05)
+filtered_patient_met_fc = filtered_patient_met_fc %>% mutate(text = keep_first_label(filtered_patient_met_fc$metabolites))
+
+generate_colors <- function(n, palette = "random_contrast") {
+  set.seed(123)
+  if (palette == "random_contrast") {
+    # Generate random contrast colors
+    colors <- sample(colors(), n)
+    return(colors)
+  } else {
+    # Existing palette options
+    default_palette <- c("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf")
+    pastel_palette <- c("#a6cee3", "#1f78b4", "#b2df8a", "#33a02c", "#fb9a99", "#e31a1c", "#fdbf6f", "#ff7f00", "#cab2d6", "#6a3d9a")
+    grayscale_palette <- gray.colors(n)
+    
+    if (palette == "default") {
+      return(default_palette[1:n])
+    } else if (palette == "rainbow") {
+      return(rainbow(n))
+    } else if (palette == "heat") {
+      return(colorRampPalette(c("red", "yellow", "orange"))(n))
+    } else if (palette == "pastel") {
+      return(pastel_palette[1:n])
+    } else if (palette == "grayscale") {
+      return(grayscale_palette[1:n])
+    } else {
+      cat("Invalid palette name. Using default palette.\n")
+      return(default_palette[1:n])
+    }
+  }
+}
+metabolites_color = generate_colors(length(unique(filtered_patient_met_fc$metabolites)))
+names(metabolites_color) = unique(filtered_patient_met_fc$metabolites)
+library(ggnewscale)
+filtered_patient_met_fc = filtered_patient_met_fc %>% 
+  mutate(ellipse_pval = -log10(as.numeric(filtered_patient_met_fc$pval))+ runif(length(filtered_patient_met_fc$pval),min =-0.05,max = 0.05))
+gg3= ggplot(filtered_patient_met_fc, aes(x=as.numeric(logfc), y=-log10(as.numeric(pval)),
+                                    colour = patientnum))+
+  scale_colour_manual(values = colors_pat)+
+  geom_point() + 
+  theme_minimal() +
+  geom_vline(xintercept=c(-0.6, 0.6), col="red") +
+  geom_hline(yintercept=-log10(0.05), col="red") +
+  new_scale_color() +
+  stat_ellipse(data = filtered_patient_met_fc, mapping = aes(x=as.numeric(logfc), y=ellipse_pval,group = metabolites,colour = metabolites),inherit.aes = F)+
+  scale_colour_manual(values = metabolites_color)+
+  geom_label_repel(
+    aes(label = text,
+        colour = metabolites), 
+    
+    box.padding = unit(0.4, "lines"),
+    point.padding = unit(0.2, "lines"),
+    force = 10)
+
+gg3
+# ggsave(plot = gg3, paste0("/stornext/Bioinf/data/lab_brain_cancer/projects/clinical_trials/trial_anheart/data/M/anheart_updates/",sample_name,"/",sample_name,"_volcano_plot.svg"),
+#        height =6, width = 15)
+############################### Pathway volcano plot
+
+View(disassembled_lc_tissue)
+
+# lc_fisher = FisherexactTest(list(metabolites = paste0("hmdb:",unique(sub(".*_", "",disassembled_lc_t$variable)))),
+#                           analyte_type = "metabolites",
+#                           alternative = "greater",
+#                           min_path_size = 5,
+#                           max_path_size = 150,
+#                           polarity = "Positive")
+
+summary_data <- standard_clean_lc %>%
+  group_by(metabolites.x) %>%
+  dplyr::summarize(
+    mean = mean(log_diff),
+    se = sd(log_diff) / sqrt(n()),
+    colour = ifelse(mean(log_diff) >= 0, "red", "blue"),
+    sourceId = variable.x
+  )
+summary_data  = unique(summary_data )
+summary_data$metabolites.x <- factor(summary_data$metabolites.x, levels = summary_data$metabolites.x)
+p_list = c()
+for(i in 1:nrow(summary_data)){
+  p_v = clean_lc_tissue$p_val[which(grepl(clean_lc_tissue$metabolites.x,
+                                                  pattern = as.character(summary_data$metabolites.x[i])))]
+  if(length(p_v) ==0){
+      p_list = c(p_list, NA)
+  }else{
+     p_list = c(p_list, unique(p_v)[1]) 
+  }
+}
+
+summary_data  = data.frame(summary_data) %>% mutate(p_val = p_list)
+summary_data = na.omit(summary_data)
+diffexpressed = apply(data.frame(cbind(summary_data$mean,summary_data$p_val)),MARGIN = 1, FUN=function(x){
+  if(x[1]>=0 & x[2]<=0.05){
+    return("Upregulated")
+  }else if(x[1]<0 & x[2]<=0.05){
+    return("Downregulated")
+  }else{
+    return("Not significant")
+  }
+})
+summary_data  = summary_data %>% mutate(diffexpressed = diffexpressed) %>%  mutate(delabel =metabolites.x)
+summary_data$delabel[which(summary_data$diffexpressed == "Not significant")]  = NA
+
+ggplot(data = summary_data, aes(x = mean, y = -log10(p_val), col = diffexpressed, label = delabel)) +
+  geom_vline(xintercept =  0, col = "green", linetype = 'dashed') +
+  geom_hline(yintercept = -log10(0.05), col = "green", linetype = 'dashed') +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("Downregulated" ="blue", "Not significant"="grey", 
+                                "Upregulated"  = "red"), # to set the colours of our variable<br />
+                     labels = c("Downregulated", "Not significant", "Upregulated")) + 
+  coord_cartesian(ylim = c(0, max(-log10((summary_data$p_val)))+0.5), xlim = c(-4, 4)) +
+  labs(color = 'Severe', 
+       x = expression("log"[2]*"FC"), y = expression("-log"[10]*"p-value")) +
+  scale_x_continuous(breaks = seq(-10, 10, 2)) + 
+  ggtitle('LC-MS volcano plot') + 
+  geom_text_repel(max.overlaps = 10,
+                  force_pull = 5,
+                    label.size = 0.15)+
+  theme(axis.line = element_line(colour = "black"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    panel.background = element_blank()) +
+    theme(legend.title=element_blank()) # To show all labels 
+```
