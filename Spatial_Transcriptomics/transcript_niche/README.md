@@ -1,6 +1,6 @@
 # Transcript niches
 
-Code used for transcript-based niches apated from Vannan, A., et al. Image-based spatial transcriptomics identifies molecular niche dysregulation associated with distal lung remodeling in pulmonary fibrosis. bioRxiv (2023).
+Code used for transcript-based niches adapted from Vannan, A., et al. Image-based spatial transcriptomics identifies molecular niche dysregulation associated with distal lung remodeling in pulmonary fibrosis. bioRxiv (2023).
 
 1. Build mRNA spatial graphs per sample using radius threshold d. Each individual transcript is a node and edges are connections between these nodes (scripts: build_graph.py, build_graph_array.sh)
 2. Create subgraph per sample from the randomly sample N root nodes (scripts: filter_and_subgraph.py, subgraph_array.sh)
