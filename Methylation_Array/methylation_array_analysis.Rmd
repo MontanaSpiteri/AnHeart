@@ -1,0 +1,227 @@
+---
+title: "Differential Methylation Analysis of Methylation (EPIC v2) Array Data"
+output: html_document
+---
+
+The following code relates to the analysis of all participant processed methylation array data 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)
+library(minfi)
+library(parallel)
+library(ComplexHeatmap) 
+library(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
+library(IlluminaHumanMethylationEPICmanifest)
+library(ggsci)
+library(gridExtra)
+library(org.Hs.eg.db)
+library(stringr)
+library(RColorBrewer)
+library(limma)
+library(reshape2)
+library(readxl)
+```
+
+## Load processed data
+
+```{r}
+mSetSqFlt <- readRDS(file="data/process/filtered_data.rds")
+targets <- readRDS(file = "data/process/targets.rds")
+
+# EPICv2 annotation 
+epic <- getAnnotation(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
+head(epic)
+```
+
+## M & Beta Values
+
+```{r}
+mVals <- getM(mSetSqFlt)
+head(mVals)
+
+bVals <- getBeta(mSetSqFlt)
+head(bVals)
+
+targets$Sample_Type <- factor(targets$Sample_Type, levels = c("Pre-treatment", "Post-treatment"))
+pal <- Polychrome::palette36.colors(20)
+densityPlot(bVals, sampGroups=targets$Sample_Name, main="Beta values", 
+            legend=FALSE, xlab="Beta values", pal = pal)
+legend("top", legend = levels(factor(targets$Sample_Name)), 
+       text.col=pal, cex = 0.5)
+densityPlot(bVals, sampGroups=targets$Sample_Type, main="Beta values", 
+            legend=FALSE, xlab="Beta values", pal = c("#0C7BDC", "#E66100"))
+legend("top", legend = levels(factor(targets$Sample_Type)), 
+       text.col=c("#0C7BDC", "#E66100"), cex = 0.8)
+densityPlot(bVals, sampGroups=targets$Patient, main="Beta values", 
+            legend=FALSE, xlab="Beta values", pal = pal)
+legend("top", legend = levels(factor(targets$Patient)), 
+       text.col=pal, cex = 0.8)
+```
+
+# Waterfall plot
+
+```{r}
+colours <- c("A-01" = "#00FFFF",
+             "A-02" = "#6A5ACD",
+             "A-03" = "#008080",
+             "A-04" = "#228B22",
+             "A-05" = "#4B0082",
+             "A-06" = "#90EE90",
+             "A-07" = "#8F00FF",
+             "O-01" = "#FF2400",
+             "O-02" = "#FFD700",
+             "O-03" = "#FF7F50")
+
+methylation_change_df <- methylation_change_df %>%
+  arrange(desc(Methylation_Ratio_Change))
+
+plot <- ggplot(methylation_change_df, aes(x = reorder(Patient, Methylation_Ratio_Change), y = Methylation_Ratio_Change, fill = Patient)) +
+  geom_bar(stat = "identity") +
+  geom_hline(yintercept = 0, color = "black") +
+  labs(
+    x = "Patient",
+    y = "Change in Methylated:Demethylated Ratio (Post-treatment vs Pre-treatment)"
+  ) +
+  theme_classic() + coord_flip() + scale_fill_manual(values = colours) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylim(-1, 1)
+```
+
+```{r}
+lower_threshold <- 0.3
+upper_threshold <- 0.7
+
+methylation_summary <- apply(bVals, 2, function(sample) {
+  methylated <- sum(sample > upper_threshold, na.rm = TRUE)  # Clearly methylated
+  demethylated <- sum(sample < lower_threshold, na.rm = TRUE)  # Clearly demethylated
+
+  if (demethylated == 0) {
+    proportion <- NA  # Avoid division by zero
+  } else {
+    proportion <- methylated / demethylated
+  }
+  return(proportion)
+})
+
+methylation_summary_df <- data.frame(
+  Sample = colnames(bVals),
+  Methylated_to_Demethylated_Ratio = methylation_summary
+)
+
+methylation_summary_df$Patient <- targets$Patient
+methylation_summary_df$Sample_Type <- targets$Sample_Type
+
+methylation_change_df <- methylation_summary_df %>%
+  group_by(Patient) %>%
+  summarize(
+    Methylation_Ratio_Change = Methylated_to_Demethylated_Ratio[Sample_Type == "Post-treatment"] - 
+                               Methylated_to_Demethylated_Ratio[Sample_Type == "Pre-treatment"],
+    .groups = "drop"
+  )
+```
+
+one-sided Kolmogorov-Smirnov Test (Post-treatment vs Pre-treatment):
+
+* Treated (Post-treatment) cells (First Group): testing if the methylation levels are stochastically lower in the IDHi treated cells.
+* Untreated (Pre-treatment) cells (Second Group): This group serves as the baseline or comparison group.
+
+This test assesses whether the treated group's methylation levels are consistently lower than those of the untreated group - finding a significant global decrease of DNA methylation in treated cells.
+
+```{r}
+# per patient density plots
+get_stars <- function(p) {
+  if (p < 0.001) {
+    return("****")
+  } else if (p < 0.01) {
+    return("***")
+  } else if (p < 0.05) {
+    return("**")
+  } else if (p < 0.1) {
+    return("*")
+  } else {
+    return("ns")
+  }
+}
+
+sig_df <- list()
+for(i in unique(targets$Patient)){
+    targets_subset <- targets[targets$Patient == i, ]
+    targets_subset$Sample_Type <- as.factor(targets_subset$Sample_Type)
+    
+    bVals_subset <- bVals[, colnames(bVals) %in% targets_subset$Sample]
+    
+    density_plot <- densityPlot(bVals_subset, sampGroups=targets_subset$Sample_Type, main=paste("Beta values", i, sep = " "), 
+            legend=FALSE, xlab="Beta values", pal = c("#0C7BDC", "#E66100"))
+    legend("topright", legend = levels(targets_subset$Sample_Type), 
+       text.col=c("#0C7BDC", "#E66100"), cex = 0.8)
+    print(density_plot)
+    
+    pre-treat <- bVals_subset[, targets_subset$Sample_Type == levels(targets_subset$Sample_Type)[1], drop=FALSE]
+    post-treat <- bVals_subset[, targets_subset$Sample_Type == levels(targets_subset$Sample_Type)[2], drop=FALSE]
+    
+        pre_vector <- as.numeric(pre-treat)
+        post_vector <- as.numeric(post-treat)
+        # one-sided Kolmogorov-Smirnov Test
+        test_result <- ks.test(post_vector, pre_vector, alternative = "less")
+        sig_df[[i]] <- test_result
+        p <- test_result$p.value
+        print(paste(i, "-", p))
+        
+        stars <- get_stars(test_result$p.value)
+        p_value_text <- sprintf(stars, test_result$p.value)
+        
+        text(x = 0.5, y = max(density(pre_vector)$y, density(post_vector)$y), labels = p_value_text, cex = 1.2, col = "black", adj = c(0.5, 0.5))
+}
+
+for(i in unique(targets$Patient)){
+    targets_subset <- targets[targets$Patient == i, ]
+    targets_subset$Sample_Type <- as.factor(targets_subset$Sample_Type)
+    
+    bVals_subset <- bVals[, colnames(bVals) %in% targets_subset$Sample]
+    
+    svg(paste0("figures/beta_density_", i, ".svg"))
+    density_plot <- densityPlot(bVals_subset, sampGroups=targets_subset$Sample_Type, main=paste("Beta values", i, sep = " "), 
+            legend=FALSE, xlab="Beta values", pal = c("#0C7BDC", "#E66100"))
+    legend("topright", legend = levels(targets_subset$Sample_Type), 
+       text.col=c("#0C7BDC", "#E66100"), cex = 0.8)
+    print(density_plot)
+    dev.off()
+}
+```
+
+## Probe-wise differential methylation (DMPs)
+
+```{r}
+sampleType <- factor(targets$Sample_Type)
+individual <- factor(targets$Patient) 
+
+design <- model.matrix(~0+sampleType+individual, data=targets)
+colnames(design) <- c(levels(sampleType),levels(individual)[-1])
+
+fit <- lmFit(mVals, design)
+contMatrix <- makeContrasts(Pre-treatment-Post-treatment,
+                           levels=design)
+contMatrix
+
+fit2 <- contrasts.fit(fit, contMatrix)
+fit2 <- eBayes(fit2)
+
+# DM CpGs at FDR < 0.05
+summary(decideTests(fit2))
+```
+No significant up or downregulated differentially methylated CpGs (FDR < 0.05).  
+
+```{r}
+# results table of differentially methylated probes for Pre-treatment - Post-treatment contrast
+epicSub <- epic[match(rownames(mVals),epic$Name),
+                      c(1:4,12:19,22:ncol(epic))]
+DMPs <- topTable(fit2, num=Inf, coef=1, genelist=epicSub)
+head(DMPs)
+
+# plot top 4 most significantly differentially methylated CpGs 
+par(mfrow=c(2,2))
+sapply(rownames(DMPs)[1:4], function(cpg){
+  plotCpg(bVals, cpg=cpg, pheno=targets$Sample_Type, ylab = "Beta values")
+})
+```
