@@ -1,0 +1,1021 @@
+---
+title: "Spitzer et al. 2024 comparison of snRNA-seq data"
+output: html_document
+---
+
+The following code relates to the comparison of snRNA-seq data to data published in a similar study by Spitzer et al., 2024 (https://www.sciencedirect.com/science/article/pii/S153561082400093X?dgcid=author#sec4)
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(SummarizedExperiment)
+library(HDF5Array)
+library(SingleCellExperiment)
+library(intrinsicDimension)
+library(scater)
+library(scuttle)
+library(BiocParallel)
+library(destiny)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(scran)
+library(limma)
+library(ggrepel)
+library(tidyverse)
+library(reshape2)
+library(BiocParallel)
+library(bluster)
+library(fgsea)
+library(pheatmap)
+library(MASS)
+library(lme4)
+library(edgeR)
+library(zoo)
+library(Seurat)
+library(GOSemSim)
+library(RRHO2)
+
+colours_comb <- c("#F28482", "#9D4EDD", "#6A994E", "#3A7CA5", "#EF233C",
+               "#F9C8C7", "#CDDEB9", "#A7C957", "#63A2C8", "#000000", "#FFEA00", "#F4F3EE",
+               "#FAA307", "#FFBA08", "#FFD60A", "#E85D04", "#F48C06", "#F2CC8F",
+               "#656D4A", "#A4AC86", "#B6AD90", "#7F4F24", "#A68A64", "#D6D1C1",
+               "#000000", "#ADB5BD",
+               "#9D0208")
+names(colours_comb) <- c("AC-like", "MES-like", "OPC-like", "NPC-like", "Progenitor",
+                      "Astrocyte", "Oligodendrocyte", "OPC", "Neuron", "Vasculature", "Immune", "Unknown",
+                      "T Cell", "NK Cell", "B Cell", "CD8 T Cell", "CD4 T Cell", "T Reg Cell", 
+                      "Dendritic Cell", "Neutrophil", "Monocyte", "Microglia", "Macrophage", "Mast Cell",
+                      "Endothelial", "Mural",
+                      "Death")
+
+colours_pop <- c("#F28482", "grey", "#000000", "#FFEA00", "#3A7CA5", "#6A994E", "#CDDEB9", "#FF474C", "#F4F3EE")
+names(colours_pop) <- c("AC", "Doublet", "Endothel", "Macrophage", "NPC", "OC", "Oligodendrocyte", "Undifferentiated", "Unresolved")
+
+colours_sample <- c("#0C7BDC", "#E66100")
+names(colours_sample) <- c("Pre-treatment", "Post-treatment")
+```
+
+# Annotate snRNA-seq data using Spitzer dataset as the reference
+
+Automatic annotation run via SingleR
+
+* Common HVGs between snRNA-seq data and Spitzer et al. reference (matched Oligodendroglioma dataset) used for SingleR scoring 
+
+```{r}
+sce_comb <- loadHDF5SummarizedExperiment("/data/process/", prefix="sce_integrated_")
+# remove participant with low tumor purity
+sce_comb <- sce_comb[, !sce_comb$Patient == "A-04"]
+sce_comb$Patient <- factor(sce_comb$Patient)
+
+# Spitzer SingleR results 
+reference <- readRDS("/public_datasets/spitzer/GSE260928_SNRNA/matched_oligo_sce.rds")
+# gene inputs
+TopHVGs <- function(x){
+  dec.parse <- modelGeneVar(x)
+  TopHVGs <- getTopHVGs(dec.parse, n=5000)
+  return(TopHVGs)
+}
+top.HVGs <- TopHVGs(sce)
+
+ReferenceHVGs <- function(x, symbol="feature_name"){
+  rownames(x) <- rowData(x)[,symbol]
+  dec <- modelGeneVar(x)
+  Reference_HVGs <- getTopHVGs(dec, n=5000)
+  return(Reference_HVGs)
+}
+reference.HVGs <- ReferenceHVGs(reference, symbol = "Symbol")
+
+CommonHVGs <- function(TopHVGs, ReferenceHVGs){
+  CommonHVGs <- intersect(TopHVGs, ReferenceHVGs)
+  return(CommonHVGs)
+}
+common.HVGs <- CommonHVGs(TopHVGs = top.HVGs, ReferenceHVGs = reference.HVGs)
+length(common.HVGs)
+
+# function
+annotate_clust <- function(sce, reference, genes, symbol="feature_name", annotation="annotation_level_3"){
+  
+  #Check for excessive amount of Ensembl gene names 
+  is.ens <- grepl("^ENSG", genes, ignore.case = TRUE)
+  num.true <- length(is.ens[is.ens == TRUE])
+  if(num.true == length(genes)){
+    print(warning("Ensembl genes detected in gene names"))
+  }
+  
+  #Check Marker Genes are actually present in dataset of interest
+  is.present <- genes %in% rownames(sce)
+  num.false <- length(is.present[is.present == FALSE])
+  if(num.false > 0){
+    print(warning("Marker genes not present in dataset of interest. Possibly wrongly named"))
+  }
+  
+  #Annotate clusters using reference dataset
+  counts(reference) <- logcounts(reference)
+  rownames(reference) <- rowData(reference)[,symbol]
+  available <- intersect(rownames(reference), rownames(sce))
+  pred_labels <- SingleR(test=sce[available,], ref=reference[available,], restrict = genes, 
+                         labels=colData(reference)[,annotation], de.method="wilcox")
+  return(pred_labels$pruned.labels)
+}
+
+# run
+anno.comHVGs <- annotate_clust(sce = sce, reference = reference, genes = common.HVGs, symbol = "Symbol", annotation = "annotation")
+sce_comb$CommonHVGs_spitz <- anno.comHVGs
+
+df <- as.data.frame(reducedDim(sce_comb, "UMAP"))
+df$SingleR_spitz <- sce_comb$CommonHVGs_spitz
+
+samp1 <- sample(1:nrow(df))
+plot <- ggplot(df[samp1,], aes(x=UMAP1[samp1], y=UMAP2[samp1])) + 
+      geom_point(col="black", size=0.9) +
+      geom_point(col="white", size=0.5) +
+      geom_point(aes(col=SingleR_spitz[samp1]), size=0.455, alpha=0.75) + scale_color_manual(values=colours_pop) +theme_void() +
+      guides(colour = guide_legend(override.aes = list(alpha = 1, size=3)))
+```
+
+# Confusion matrix - Jaccard Similarity 
+
+Compare assigned cell type annotations between the two datasets
+
+```{r}
+drummond <- as.character(sce_comb$annotation)
+spitzer <- as.character(sce_comb$CommonHVGs_spitz)
+
+calculate_jaccard <- function(x, y) {
+  intersection <- length(intersect(x, y))
+  union <- length(union(x, y))
+  jaccard_index <- intersection / union
+  return(jaccard_index)
+}
+
+unique_drummond <- unique(drummond)
+unique_spitzer <- unique(spitzer)
+
+jaccard_matrix <- matrix(nrow = length(unique_drummond), ncol = length(unique_spitzer), dimnames = list(unique_drummond, unique_spitzer))
+
+for (i in seq_along(unique_drummond)) {
+  for (j in seq_along(unique_spitzer)) {
+    cells_in_i <- which(drummond == unique_drummond[i])
+    cells_in_j <- which(spitzer == unique_spitzer[j])
+    jaccard_matrix[i, j] <- calculate_jaccard(cells_in_i, cells_in_j)
+  }
+}
+jaccard_matrix
+
+jaccard_matrix <- jaccard_matrix[, -8]
+
+p <- pheatmap(jaccard_matrix,
+         color = colorRampPalette(c("#fffee0", "orange", "red"))(120),
+         display_numbers = T,
+         clustering_distance_rows = "euclidean",
+         clustering_distance_cols = "euclidean")
+
+jaccard_matrix <- jaccard_matrix[, c("AC", "OC")]
+jaccard_matrix <- jaccard_matrix[c("AC-like", "OPC-like"), ]
+
+p <- pheatmap(jaccard_matrix,
+         color = colorRampPalette(c("#fffee0", "orange", "red"))(120),
+         display_numbers = T,
+         clustering_distance_rows = "euclidean",
+         clustering_distance_cols = "euclidean")
+```
+
+## Rank-Rank Hypergeometric Overlap analysis
+
+* GSEA pathways
+* scores: -log10(pvalue) * sign(effectSize)
+* Checked that both studies have performed GSEA in the same direction (Pre-treatment vs Post-treatment)
+
+```{r}
+# Spitzer et al. 2024 downloaded GSEA results
+gsea_spitz <- read_xlsx("/public_datasets/spitzer/mmc4 (1).xlsx", sheet = 2, skip = 2)
+unique_sets <- gsea_spitz[gsea_spitz$`Associated program` %in% c("AC-cancer", "AC-normal", "OC-normal", "OPC-normal", "Cell-cycle", "NPC-cancer", "OC-cancer"), ]
+
+# average scores for certain modules
+sum_sets <- unique_sets %>%
+  dplyr::group_by(`Associated program`) %>%
+  dplyr::summarise(
+    `BH-adjusted p value` = mean(`BH-adjusted p value`, na.rm = TRUE),
+    NES = mean(NES, na.rm = TRUE),
+    pval = mean(pval, na.rm = TRUE),
+    `Geneset size` = mean(`Geneset size`, na.rm = TRUE),
+    `Fraction in ranked list edges` = mean(`Fraction in ranked list edges`, na.rm = TRUE),
+    Pathway = dplyr::first(`Associated program`)  
+  )
+sum_sets$Pathway <- c("AC-like", "Astrocyte", "Cell-cycle", "NPC-like", "OPC-like", "Oligodendrocyte", "OPC-normal")
+
+gsea_spitz <- rbind(sum_sets, gsea_spitz)
+colnames(gsea_spitz) <- c("Associated Program", "padj", "NES", "pval", "size", "ES", "pathway")
+
+# GSEA all cell type populations (Spitzer GSEA method)
+gsea_drummond <- readRDS("output/gsea/gsea_results_all.rds")
+gsea_drummond <- gsea_drummond$GSEA_Results
+```
+
+```{r}
+# Rank-Rank Hypergeometric Overlap analysis
+drummond_df <- gsea_drummond %>%
+  dplyr::mutate(score = -log10(padj) * sign(NES)) %>%
+  dplyr::select(pathway, score) %>%
+  dplyr::filter(!is.na(score))
+
+spitzer_df <- gsea_spitz %>%
+  dplyr::mutate(score = -log10(padj) * sign(NES)) %>%
+  dplyr::select(pathway, score) %>%
+  dplyr::filter(!is.na(score))
+
+paths <- intersect(drummond_df$pathway, spitzer_df$pathway)
+drummond_df <- drummond_df[drummond_df$pathway %in% paths, ]
+spitzer_df <- spitzer_df[spitzer_df$pathway %in% paths, ]
+drummond_df$pathway <- factor(drummond_df$pathway, levels = paths)
+spitzer_df$pathway <- factor(spitzer_df$pathway, levels = paths)
+drummond_df <- drummond_df[order(drummond_df$pathway), ]
+spitzer_df <- spitzer_df[order(spitzer_df$pathway), ]
+drummond_df$pathway <- as.character(drummond_df$pathway)
+spitzer_df$pathway <- as.character(spitzer_df$pathway)
+
+RRHO_obj <-  RRHO2_initialize(as.data.frame(drummond_df), as.data.frame(spitzer_df), labels = c("Drummond", "Spitzer"), log10.ind=TRUE)
+RRHO2_heatmap(RRHO_obj)
+
+RRHO2_vennDiagram(RRHO_obj, type="dd")
+RRHO2_vennDiagram(RRHO_obj, type="uu")
+RRHO2_vennDiagram(RRHO_obj, type="ud")
+RRHO2_vennDiagram(RRHO_obj, type="du")
+```
+
+
+## Responder vs Non-responder analysis
+
+# Annotate Spitzer matched datasets
+
+Responder:
+
+Spitzer Matched Oligodendroglioma dataset
+* 1 x matched Oligodendroglioma patient (BWH445_Pre & BWH445_Post)
+
+```{r}
+# load
+sce <- readRDS("/public_datasets/spitzer/GSE260928_SNRNA/matched_oligo_sce.rds")
+sce$Treatment <- ifelse(grepl("PRE", sce$Tumor), "Pre-treatment", 
+                       ifelse(grepl("POST", sce$Tumor), "Post-treatment", NA))
+sce$Patient <- "BWH445"
+```
+
+```{r}
+# scVI batch correction performed (adapted from scvi_integration.py & snrna-seq_integration_and_annotation.Rmd scripts)
+# scvi.model.SCVI.setup_anndata(adata, batch_key="Treatment")
+
+set.seed(0010101010)
+Clusters <- scran::clusterCells(sce, use.dimred="X_scVI", 
+                                BLUSPARAM=SNNGraphParam(k=35, type="rank", cluster.fun="leiden"))
+table(Clusters)
+sce$Cluster <- Clusters
+
+df <- reducedDim(sce, "UMAP")
+df <- as.data.frame(df)
+df$Sample <- sce$Treatment
+df$Cluster <- sce$Cluster
+df$anno <- sce$annotation
+colnames(df)[1:2] <- c("UMAP1", "UMAP2")
+
+ggplot(df[sample(1:nrow(df)),], aes(x=UMAP1, y=UMAP2, color=Sample)) + geom_point(alpha=0.5) + theme_classic()
+
+colours_clusters <- Polychrome::palette36.colors(12)
+names(colours_clusters) <- 1:12
+
+ggplot(df[sample(1:nrow(df)),], aes(x=UMAP1, y=UMAP2, color=Cluster)) + geom_point(alpha=0.5) + 
+  theme_classic() +
+guides(colour = guide_legend(override.aes = list(alpha = 1, size=3))) + scale_color_manual(values=colours_clusters)
+
+# inspect marker genes
+markers <- function(x, marker){
+  x$marker <- as.vector(logcounts(x[marker,]))
+  plot_data <- data.frame(UMAP1 = reducedDim(x, "UMAP")[,1],
+                          UMAP2 = reducedDim(x, "UMAP")[,2],
+                          Expression = x$marker)
+  plot_data <- plot_data[order(plot_data$Expression), ]
+  plot <- ggplot(plot_data, aes(x = UMAP1, y = UMAP2, color = Expression)) +
+    geom_point(size=0.5) + 
+    theme(aspect.ratio = 1) + 
+    ggtitle(marker) + 
+    scale_color_viridis_c() +
+      theme_classic()
+  return(plot)
+}
+```
+
+### AC-like
+
+```{r, echo=FALSE}
+marker_genes <- c("APOE","AQP4", "MGAT4C", "SPARCL1", "GFAP", "ALDOC")
+lapply(marker_genes, function(marker) markers(sce, marker))
+```
+
+### MES-like
+
+```{r, echo=FALSE}
+marker_genes <- c("PDGFRA", "CHI3L1", "TNC", "ITGB1", "NRN1", "TIMP1", "S100A10")
+lapply(marker_genes, function(marker) markers(sce, marker))
+```
+
+### OPC-like
+
+```{r, echo=FALSE}
+marker_genes <- c("APOD", "OLIG1", "OLIG2", "DLL3", "SOX8", "PDGFRA")
+lapply(marker_genes, function(marker) markers(sce, marker))
+```
+
+### Progenitor
+
+```{r, echo=FALSE}
+marker_genes <- c("TOP2A", "MKI67", "CENPF", "TUBA1B")
+lapply(marker_genes, function(marker) markers(sce, marker))
+
+marker_genes <- c("TOP2A", "MKI67", "CENPF", "TUBA1B")
+lapply(marker_genes, function(marker) markers(sce_responder, marker))
+```
+
+### NPC-like
+
+```{r, echo=FALSE}
+marker_genes <- c("HES6", "STMN2", "LMO4", "RAB3C", "S100A1", "DLX5", "ELAVL4", "SOX4", "CCND2", "RBM6", "SET", "TRA2A")
+lapply(marker_genes, function(marker) markers(sce, marker))
+```
+
+### Neuron
+
+```{r}
+marker_genes <- c("NPTXR", "STMN2", "CDH13", "THY1", "LMO4")
+lapply(marker_genes, function(marker) markers(sce, marker))
+
+# excitatory
+marker_genes <- c("NRN1", "HOPX", "HS3ST4", "TRPM3", "EPHA4", "LMO4")
+lapply(marker_genes, function(marker) markers(sce, marker))
+
+# inhibitory
+marker_genes <- c("MAF", "GRIK1", "SPOCK3", "KIT")
+lapply(marker_genes, function(marker) markers(sce, marker))
+
+# interneuron
+marker_genes <- c("PVALB", "VIP", "CCK", "CRH", "HTR3A", "GAD1", "GAD2")
+lapply(marker_genes, function(marker) markers(sce, marker))
+```
+
+### OPC
+
+```{r}
+marker_genes <- c("CNP", "CA10",  "APOD", "GPNMB", "CSPG4", "CD9")
+lapply(marker_genes, function(marker) markers(sce, marker))
+```
+
+### Endothelial
+
+```{r, echo=FALSE}
+marker_genes <- c("IGFBP7", "DCN", "COL4A2")
+lapply(marker_genes, function(marker) markers(sce, marker))
+```
+
+### Astrocyte
+
+```{r, echo=FALSE}
+marker_genes <- c("MGST1", "NTRK2", "SLC1A3", "SLC1A2", "FAM107A", "CST3", "GJA1")
+lapply(marker_genes, function(marker) markers(sce, marker))
+```
+
+### Oligodendrocyte
+
+```{r, echo=FALSE}
+marker_genes <- c("ERMN", "MBP", "MAL", "MOG")
+lapply(marker_genes, function(marker) markers(sce, marker))
+```
+
+### Immune Markers
+
+```{r, echo=FALSE}
+# Immune Markers
+
+## T Cell
+marker_genes <- c("CD4", "CD8A", "CD27", "PTPRC", "CD28", "KLRB1", "CD69", "FOXP3")
+lapply(marker_genes, function(marker) markers(sce, marker))
+## B-cells
+marker_genes <- c("CD79A", "BANK1")
+lapply(marker_genes, function(marker) markers(sce, marker))
+## Macrophage
+marker_genes <- c("CD163", "CD68")
+lapply(marker_genes, function(marker) markers(sce, marker))
+## Neutrophil
+marker_genes <- c("ITGAX", "SLC11A1")
+lapply(marker_genes, function(marker) markers(sce, marker))
+## Monocyte
+marker_genes <- c("VCAN", "FCER1G", "CD14")
+lapply(marker_genes, function(marker) markers(sce, marker))
+## Dendritic Cell
+marker_genes <- c("S100A4", "HLA-DQA1", "HLA-DQB1")
+lapply(marker_genes, function(marker) markers(sce, marker))
+## NK cells
+marker_genes <- c("KLRC1", "GNLY") 
+lapply(marker_genes, function(marker) markers(sce, marker))
+## Microglia
+marker_genes <- c("P2RY12", "CX3CR1")
+lapply(marker_genes, function(marker) markers(sce, marker))
+```
+
+```{r}
+# assign final annotations
+annotation <- read.csv(file = "/data/process/spitzer_annos_oligo.csv")
+sce$annotation <- annotation$annotation[match(sce$Cluster, annotation$cluster)]
+sce$annotation <- factor(sce$annotation)
+df$annotation <- sce$annotation
+
+# Plot UMAP
+sce_responder <- sce
+
+df <- as.data.frame(reducedDim(sce_responder, "UMAP"))
+colnames(df) <- c("UMAP1", "UMAP2")
+df$sample <- sce_responder$Patient
+df$Sample <- sce_responder$Treatment
+df$annotation <- sce_responder$annotation
+
+samp1 <- sample(1:nrow(df))
+themes <- theme_void()
+
+plot <- ggplot(df[samp1,], aes(x=UMAP1[samp1], y=UMAP2[samp1])) + 
+      geom_point(col="black", size=0.9) +
+      geom_point(col="white", size=0.5) +
+      geom_point(aes(col=annotation[samp1]), size=0.455, alpha=0.75) +
+      scale_color_manual(values=colours_comb) + themes +
+      guides(colour = guide_legend(override.aes = list(alpha = 1, size=3)))
+```
+
+
+Non-responder:
+
+Spitzer Matched Astrocytoma dataset
+* 2 x matched Astrocytoma patients (BWH5033_Pre, BWH5033_Post & PARIS_Pre, PARIS_Post)
+* Spitzer Matched Astrocytoma datasets combined: 27690 genes, 19363 cells
+
+```{r}
+# load UMI
+spitzer1 <- read.table("/public_datasets/spitzer/GSE260928_SNRNA/GSE260928_Chromium_Astrocytoma1_processed_UMI.tsv")
+spitzer2 <- read.table("/public_datasets/spitzer/GSE260928_SNRNA/GSE260928_Chromium_Astrocytoma2_processed_UMI.tsv")
+same <- intersect(rownames(spitzer1), rownames(spitzer2))
+spitzer1 <- spitzer1[same, ]
+spitzer2 <- spitzer2[same, ]
+spitzer <- cbind(spitzer1, spitzer2)
+rm(spitzer1, spitzer2)
+gc()
+
+matched <- data.frame(cell_id = colnames(spitzer))
+rownames(matched) <- matched$cell_id
+matched$Patient <- sub("_.*", "", matched$cell_id)
+matched$Treatment <- ifelse(grepl("PRE", matched$cell_id), "Pre-treatment", 
+                       ifelse(grepl("POST", matched$cell_id), "Post-treatment", NA))
+```
+
+```{r}
+# convert to SCE object
+sce <- SingleCellExperiment(
+  assays = list(counts = as.matrix(spitzer)),
+  colData = matched
+)
+
+# logcounts
+sce <- logNormCounts(sce)
+sce$Treatment <- factor(sce$Treatment)
+
+sce$sample <- paste0(sce$Patient, "_", sce$Treatment)
+
+# scVI batch correction performed (adapted from scvi_integration.py & snrna-seq_integration_and_annotation.Rmd scripts)
+# scvi.model.SCVI.setup_anndata(adata, batch_key="sample")
+
+set.seed(0010101010)
+Clusters <- scran::clusterCells(sce, use.dimred="X_scVI", 
+                                BLUSPARAM=SNNGraphParam(k=50, type="rank", cluster.fun="leiden"))
+table(Clusters)
+sce$Cluster <- Clusters
+
+df <- reducedDim(sce, "UMAP")
+df <- as.data.frame(df)
+df$Sample <- sce$Treatment
+df$Cluster <- sce$Cluster
+df$sample <- sce$sample
+colnames(df)[1:2] <- c("UMAP1", "UMAP2")
+
+ggplot(df[sample(1:nrow(df)),], aes(x=UMAP1, y=UMAP2, color=Sample)) + geom_point(alpha=0.5) + theme_classic()
+ggplot(df[sample(1:nrow(df)),], aes(x=UMAP1, y=UMAP2, color=sample)) + geom_point(alpha=0.5) + theme_classic()
+
+colours_clusters <- Polychrome::palette36.colors(12)
+names(colours_clusters) <- 1:12
+
+ggplot(df[sample(1:nrow(df)),], aes(x=UMAP1, y=UMAP2, color=Cluster)) + geom_point(alpha=0.5) + 
+  theme_classic() +
+guides(colour = guide_legend(override.aes = list(alpha = 1, size=3))) + scale_color_manual(values=colours_clusters)
+```
+
+### AC-like
+
+```{r, echo=FALSE}
+marker_genes <- c("APOE","AQP4", "MGAT4C", "SPARCL1", "GFAP", "ALDOC")
+lapply(marker_genes, function(marker) markers(sce, marker))
+```
+
+### MES-like
+
+```{r, echo=FALSE}
+marker_genes <- c("PDGFRA", "CHI3L1", "TNC", "ITGB1", "NRN1", "TIMP1", "S100A10")
+lapply(marker_genes, function(marker) markers(sce, marker))
+```
+
+### OPC-like
+
+```{r, echo=FALSE}
+marker_genes <- c("APOD", "OLIG1", "OLIG2", "DLL3", "SOX8", "PDGFRA")
+lapply(marker_genes, function(marker) markers(sce, marker))
+```
+
+### Progenitor
+
+```{r, echo=FALSE}
+marker_genes <- c("TOP2A", "MKI67", "CENPF", "TUBA1B")
+lapply(marker_genes, function(marker) markers(sce, marker))
+```
+
+### NPC-like
+
+```{r, echo=FALSE}
+marker_genes <- c("HES6", "STMN2", "LMO4", "RAB3C", "S100A1", "DLX5", "ELAVL4", "SOX4", "CCND2", "RBM6", "SET", "TRA2A")
+lapply(marker_genes, function(marker) markers(sce, marker))
+```
+
+### Neuron
+
+```{r}
+marker_genes <- c("NPTXR", "STMN2", "CDH13", "THY1", "LMO4")
+lapply(marker_genes, function(marker) markers(sce, marker))
+
+# excitatory
+marker_genes <- c("NRN1", "HOPX", "HS3ST4", "TRPM3", "EPHA4", "LMO4")
+lapply(marker_genes, function(marker) markers(sce, marker))
+
+# inhibitory
+marker_genes <- c("MAF", "GRIK1", "SPOCK3", "KIT")
+lapply(marker_genes, function(marker) markers(sce, marker))
+
+# interneuron
+marker_genes <- c("PVALB", "VIP", "CCK", "CRH", "HTR3A", "GAD1", "GAD2")
+lapply(marker_genes, function(marker) markers(sce, marker))
+```
+
+### OPC
+
+```{r}
+marker_genes <- c("CNP", "CA10",  "APOD", "GPNMB", "CSPG4", "CD9")
+lapply(marker_genes, function(marker) markers(sce, marker))
+```
+
+### Endothelial
+
+```{r, echo=FALSE}
+marker_genes <- c("IGFBP7", "DCN", "COL4A2")
+lapply(marker_genes, function(marker) markers(sce, marker))
+```
+
+### Astrocyte
+
+```{r, echo=FALSE}
+marker_genes <- c("MGST1", "NTRK2", "SLC1A3", "SLC1A2", "FAM107A", "CST3", "GJA1")
+lapply(marker_genes, function(marker) markers(sce, marker))
+```
+
+### Oligodendrocyte
+
+```{r, echo=FALSE}
+marker_genes <- c("ERMN", "MBP", "MAL", "MOG")
+lapply(marker_genes, function(marker) markers(sce, marker))
+```
+
+### Immune Markers
+
+```{r, echo=FALSE}
+# Immune Markers
+
+## T Cell
+marker_genes <- c("CD4", "CD8A", "CD27", "PTPRC", "CD28", "KLRB1", "CD69", "FOXP3")
+lapply(marker_genes, function(marker) markers(sce, marker))
+## B-cells
+marker_genes <- c("CD79A", "BANK1")
+lapply(marker_genes, function(marker) markers(sce, marker))
+## Macrophage
+marker_genes <- c("CD163", "CD68")
+lapply(marker_genes, function(marker) markers(sce, marker))
+## Neutrophil
+marker_genes <- c("ITGAX", "SLC11A1")
+lapply(marker_genes, function(marker) markers(sce, marker))
+## Monocyte
+marker_genes <- c("VCAN", "FCER1G", "CD14")
+lapply(marker_genes, function(marker) markers(sce, marker))
+## Dendritic Cell
+marker_genes <- c("S100A4", "HLA-DQA1", "HLA-DQB1")
+lapply(marker_genes, function(marker) markers(sce, marker))
+## NK cells
+marker_genes <- c("KLRC1", "GNLY") 
+lapply(marker_genes, function(marker) markers(sce, marker))
+## Microglia
+marker_genes <- c("P2RY12", "CX3CR1")
+lapply(marker_genes, function(marker) markers(sce, marker))
+```
+
+```{r}
+# assign final annotations
+annotation <- read.csv(file = "/data/process/spitzer_annos.csv")
+sce$annotation <- annotation$annotation[match(sce$Cluster, annotation$cluster)]
+sce$annotation <- factor(sce$annotation)
+df$annotation <- sce$annotation
+
+# Plot UMAP - PARIS only
+sce <- sce[, sce$Patient == "PARIS"]
+
+df <- as.data.frame(reducedDim(sce, "UMAP"))
+colnames(df) <- c("UMAP1", "UMAP2")
+df$sample <- sce$Patient
+df$annotation <- sce$annotation
+
+samp1 <- sample(1:nrow(df))
+themes <- theme_void()
+
+plot <- ggplot(df[samp1,], aes(x=UMAP1[samp1], y=UMAP2[samp1])) + 
+      geom_point(col="black", size=0.9) +
+      geom_point(col="white", size=0.5) +
+      geom_point(aes(col=annotation[samp1]), size=0.455, alpha=0.75) +
+      scale_color_manual(values=colours_comb) + themes +
+      guides(colour = guide_legend(override.aes = list(alpha = 1, size=3)))
+```
+
+# LOESS plot
+
+```{r}
+# per cell population
+calculate_logfc <- function(sce, anno, Treatment = "Treatment", condition1 = "Pre-treatment", condition2 = "Post-treatment") {
+  # cell population
+  sce_info <- sce[, sce$annotation == anno]
+  expr_condition1 <- assay(sce_info[, sce_info[[Treatment]] == condition1], "logcounts")
+  expr_condition2 <- assay(sce_info[, sce_info[[Treatment]] == condition2], "logcounts")
+  logfc <- rowMeans(expr_condition2) - rowMeans(expr_condition1)
+  return(logfc)
+}
+
+# non-responders
+sce_nonresponder <- sce
+sce_nonresponder <- sce_nonresponder[, sce_nonresponder$annotation %in% c("AC-like", "OPC-like", "Progenitor")]
+sce_nonresponder$annotation <- factor(sce_nonresponder$annotation, levels = c("AC-like", "OPC-like", "Progenitor"))
+# patient PARIS only
+sce_nonresponder <- sce_nonresponder[, sce_nonresponder$Patient == "PARIS"]
+
+anno_values <- unique(sce_nonresponder$annotation)
+logfc_results_nonresponder <- lapply(anno_values, function(anno) {
+  calculate_logfc(sce_nonresponder, anno = anno)
+})
+logfc_results_nonresponder <- do.call(cbind, logfc_results_nonresponder)
+colnames(logfc_results_nonresponder) <- anno_values
+
+rm(sce_nonresponder)
+gc()
+
+# responder
+sce_responder <- sce_responder[, sce_responder$annotation %in% c("AC-like", "OPC-like", "Progenitor")]
+sce_responder$annotation <- factor(sce_responder$annotation, levels = c("AC-like", "OPC-like", "Progenitor"))
+
+anno_values <- unique(sce_responder$annotation)
+logfc_results_responder <- lapply(anno_values, function(anno) {
+  calculate_logfc(sce_responder, anno = anno)
+})
+logfc_results_responder <- do.call(cbind, logfc_results_responder)
+colnames(logfc_results_responder) <- c("Progenitor", "AC-like", "OPC-like")
+
+colnames(logfc_results_responder) <- paste0(colnames(logfc_results_responder), "_Responder")
+colnames(logfc_results_nonresponder) <- paste0(colnames(logfc_results_nonresponder), "_Non-Responders")
+
+keep <- intersect(rownames(logfc_results_responder), rownames(logfc_results_nonresponder))
+logfc_results_responder <- logfc_results_responder[keep, ]
+logfc_results_nonresponder <- logfc_results_nonresponder[keep, ]
+
+logfc <- cbind(logfc_results_responder, logfc_results_nonresponder)
+
+# Difference in logFC (+ve enriched in Responder, -ve enriched in Non-Responders)
+anno_values <- c("AC-like", "OPC-like", "Progenitor")
+logfc_difference <- list()
+for (i in anno_values) {
+  responder_col <- paste0(i, "_Responder")
+  nonresponder_col <- paste0(i, "_Non-Responders")
+  
+  logfc_difference[[i]] <- logfc[, responder_col] - logfc[, nonresponder_col]
+}
+
+ranked_list <- list()
+for (i in names(logfc_difference)) {
+  ranked_list[[i]] <- sort(logfc_difference[[i]], decreasing = TRUE)
+}
+
+for(i in names(ranked_list)){
+    gsea_subset <- ranked_list[[i]]
+    stat <- as.data.frame(gsea_subset)
+    stat <- cbind(rownames(stat), stat)
+    colnames(stat) <- c("gene", "stat")
+    
+    stat <- merge(stat, program_data, by = "gene", all.x = TRUE)
+    stat <- stat[order(stat$stat),]  # Sort by stat
+    
+    # Define the range of stat
+    min_stat <- min(stat$stat)
+    max_stat <- max(stat$stat)
+
+    # Calculate the window range
+    step_size <- 0.10
+    window_size <- 30  # Approximate number of genes per window
+
+    # Create a sequence of window centers
+    window_centers <- seq(min_stat, max_stat, by = step_size)
+    
+    # Create windows around each center to contain approximately 30 genes
+    window_limits <- lapply(window_centers, function(center) {
+        lower_bound <- center - (step_size / 2)
+        upper_bound <- center + (step_size / 2)
+        close_genes <- stat$stat >= lower_bound & stat$stat < upper_bound
+        # Adjust bounds if less than 30 genes are found
+        while(sum(close_genes) < window_size && (lower_bound > min_stat || upper_bound < max_stat)) {
+            if (lower_bound > min_stat) lower_bound <- lower_bound - step_size / 4
+            if (upper_bound < max_stat) upper_bound <- upper_bound + step_size / 4
+            close_genes <- stat$stat >= lower_bound & stat$stat < upper_bound
+        }
+        list(start = lower_bound, end = upper_bound)
+    })
+
+    # percentages for each window
+    calc_percentages <- function(limits) {
+        subset <- stat %>%
+            filter(stat >= limits$start, stat < limits$end, !is.na(Program)) 
+        
+        total_genes <- nrow(subset)
+        all_programs <- unique(program_data$Program)
+        
+        if(total_genes == 0) {
+            return(data.frame(Program = all_programs, Percentage = 0, Window = (limits$start + limits$end) / 2))
+        }
+
+        percentages <- subset %>%
+            dplyr::group_by(Program) %>%
+            dplyr::summarise(Percentage = n() / total_genes * 100, .groups = 'drop')
+        
+        complete_percentages <- merge(data.frame(Program = all_programs), percentages, by = "Program", all.x = TRUE)
+        complete_percentages[is.na(complete_percentages$Percentage), "Percentage"] <- 0
+        complete_percentages$Window <- (limits$start + limits$end) / 2
+        
+        return(complete_percentages)
+    }
+    stat <- na.omit(stat)
+
+    percentages <- lapply(window_limits, calc_percentages)
+    percentages_df <- do.call(rbind, percentages)
+
+    plot <- ggplot(percentages_df, aes(x = Window, y = Percentage, color = Program)) +
+        geom_point(alpha = 0.5, size = 0.8) +
+        geom_smooth(method = "loess", span = 0.5, se = FALSE) +
+        labs(title = paste0(i),
+             x = "Responder vs Non-Responders [Difference in LogFC]",
+             y = "% Genes in Tumour Program [in sliding window]",
+             color = "Gene Program") +
+        theme_classic() + 
+        scale_y_continuous(limits = c(0, 100), breaks = seq(0, 100, by = 10)) +
+        scale_color_manual(values = c("AC-like" = "#F28482", "OPC-like" = "#6A994E", "NPC-like" = "#3A7CA5", "MES-like" = "#9D4EDD"))
+
+    print(plot)
+}
+```
+
+# Progenitor ternary metabolism plots
+
+```{r}
+glycolysis_genes <- c("HK1", "HK2", "HK3", "GPI", "PFKL", "PFKM", "PFKP", 
+                      "ALDOA", "ALDOB", "ALDOC", "TPI1", "GAPDH", "GAPDHS", 
+                      "PGK1", "PGK2", "PGAM1", "PGAM2", "PGAM4", "ENO1", 
+                      "ENO2", "ENO3", "PKM", "PKLR")
+
+krebs_genes <- c("CS", "IDH1", "IDH2", "IDH3A", "IDH3B", "IDH3G", "OGDH", "OGDHL", "SDHA", "SDHB", "SDHC", "SDHD", "FH", "MDH1", "MDH2")
+
+gene_sets <- readRDS("/public_datasets/gene_sets/all_genesets_list.rds")
+interest <- gene_sets[grep("GOBP_LACTATE_METABOLIC_PROCESS", names(gene_sets))]
+lactate_genes <- interest[[1]]
+```
+
+```{r}
+# responder
+sce_responder <- sce_responder[, sce_responder$annotation %in% c("Progenitor")]
+sce_responder$Info <- paste0(sce_responder$Patient, "_", sce_responder$Treatment)
+
+sce_responder$glycolysis_score <- colMeans(logcounts(sce_responder[rownames(sce_responder) %in% glycolysis_genes, ]))
+sce_responder$krebs_score <- colMeans(logcounts(sce_responder[rownames(sce_responder) %in% krebs_genes, ]))
+sce_responder$lactate_score <- colMeans(logcounts(sce_responder[rownames(sce_responder) %in% lactate_genes, ]))
+
+plot_data <- data.frame(
+  Patient = sce_responder$Patient,
+  Info = sce_responder$Info,
+  Glycolysis = sce_responder$glycolysis_score,
+  Krebs = sce_responder$krebs_score,
+  Lactate = sce_responder$lactate_score,
+  Treatment = sce_responder$Treatment
+)
+
+# Normalise scores sum to 1 for each cell
+plot_data <- transform(plot_data, Total = Glycolysis + Krebs + Lactate)
+plot_data <- transform(plot_data,
+                       Glycolysis = Glycolysis / Total,
+                       Krebs = Krebs / Total,
+                       Lactate = Lactate / Total)
+
+means <- plot_data %>%
+    dplyr::group_by(Treatment) %>%
+    dplyr::summarise(
+      Glycolysis = mean(Glycolysis, na.rm = TRUE),
+      Krebs = mean(Krebs, na.rm = TRUE),
+      Lactate = mean(Lactate, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+plot_data$Treatment <- factor(plot_data$Treatment, levels = c("Pre-treatment", "Post-treatment"))
+plot <- ggtern(plot_data, aes(x = Glycolysis, y = Krebs, z = Lactate, fill = Treatment)) +
+  stat_density_tern(aes(alpha = ..level..), geom = "polygon", color = NA) + 
+  stat_density_tern(aes(color = Treatment), geom = "path", size = 0.5, alpha = 0.9) + 
+    geom_point(
+      data = means,
+      aes(x = Glycolysis, y = Krebs, z = Lactate, fill = Treatment),
+      size = 4,
+      shape = 21,  
+      color = "black"  
+    ) +
+  labs(
+    x = "Glycolysis",
+    y = "Krebs",
+    z = "Lactate"
+  ) +
+  theme_classic() +
+  theme_arrowlong() + 
+  scale_fill_manual(values = colours_sample) +   
+  scale_color_manual(values = colours_sample) +    
+  scale_alpha_continuous(range = c(0.2, 0.95)) +  
+  theme(
+    axis.title = element_text(size = 8),       
+    axis.text = element_text(size = 5),        
+    strip.text = element_text(size = 10),     
+    plot.title = element_text(size = 12, face = "bold")
+  )
+
+# non-responder
+sce_nonresponder <- sce_nonresponder[, sce_nonresponder$annotation %in% c("Progenitor")]
+sce_nonresponder$Info <- paste0(sce_nonresponder$Patient, "_", sce_nonresponder$Treatment)
+
+sce_nonresponder$glycolysis_score <- colMeans(logcounts(sce_nonresponder[rownames(sce_nonresponder) %in% glycolysis_genes, ]))
+sce_nonresponder$krebs_score <- colMeans(logcounts(sce_nonresponder[rownames(sce_nonresponder) %in% krebs_genes, ]))
+sce_nonresponder$lactate_score <- colMeans(logcounts(sce_nonresponder[rownames(sce_nonresponder) %in% lactate_genes, ]))
+
+plot_data <- data.frame(
+  Patient = sce_nonresponder$Patient,
+  Info = sce_nonresponder$Info,
+  Glycolysis = sce_nonresponder$glycolysis_score,
+  Krebs = sce_nonresponder$krebs_score,
+  Lactate = sce_nonresponder$lactate_score,
+  Treatment = sce_nonresponder$Treatment
+)
+
+# Normalise scores sum to 1 for each cell
+plot_data <- transform(plot_data, Total = Glycolysis + Krebs + Lactate)
+plot_data <- transform(plot_data,
+                       Glycolysis = Glycolysis / Total,
+                       Krebs = Krebs / Total,
+                       Lactate = Lactate / Total)
+
+means <- plot_data %>%
+    dplyr::group_by(Treatment) %>%
+    dplyr::summarise(
+      Glycolysis = mean(Glycolysis, na.rm = TRUE),
+      Krebs = mean(Krebs, na.rm = TRUE),
+      Lactate = mean(Lactate, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+plot_data$Treatment <- factor(plot_data$Treatment, levels = c("Pre-treatment", "Post-treatment"))
+plot <- ggtern(plot_data, aes(x = Glycolysis, y = Krebs, z = Lactate, fill = Treatment)) +
+  stat_density_tern(aes(alpha = ..level..), geom = "polygon", color = NA) + 
+  stat_density_tern(aes(color = Treatment), geom = "path", size = 0.5, alpha = 0.9) + 
+  geom_point(
+      data = means,
+      aes(x = Glycolysis, y = Krebs, z = Lactate, fill = Treatment),
+      size = 4,
+      shape = 21, 
+      color = "black" 
+    ) +
+  labs(
+    x = "Glycolysis",
+    y = "Krebs",
+    z = "Lactate"
+  ) +
+  theme_classic() +
+  theme_arrowlong() + 
+  scale_fill_manual(values = colours_sample) +   
+  scale_color_manual(values = colours_sample) +    
+  scale_alpha_continuous(range = c(0.2, 0.95)) +  
+  theme(
+    axis.title = element_text(size = 8),       
+    axis.text = element_text(size = 5),        
+    strip.text = element_text(size = 10),     
+    plot.title = element_text(size = 12, face = "bold")
+  )
+```
+
+# Inspect genes of interest - Progenitors
+
+```{r}
+# DEG violin
+genes_of_interest <- c("BMPER", "MYRF")
+
+# Responder
+exprs_data <- as.data.frame(t(logcounts(sce_responder)[genes_of_interest, ]))
+exprs_data$Treatment <- sce_responder$Treatment
+exprs_data$Treatment <- factor(exprs_data$Treatment, levels = c("Pre-treatment", "Post-treatment"))
+
+for (i in seq_along(genes_of_interest)) {
+    gene <- genes_of_interest[i]
+    t_test_result <- t.test(exprs_data[[gene]] ~ exprs_data$Treatment)
+    t_test_result
+
+  gg1 <- ggplot(exprs_data, aes_string(x="Treatment", y=genes_of_interest[i], fill="Treatment")) +
+    geom_violin(trim=TRUE) +
+    scale_fill_manual(values=colours_sample) +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          axis.title.x = element_blank(),
+          legend.title = element_blank()) +
+    labs(
+      title = paste0("p-value: ", signif(t_test_result$p.value, 3))
+    )
+  
+  print(gg1)
+}
+
+p_values <- numeric(length(genes_of_interest))
+for (i in seq_along(genes_of_interest)) {
+    gene <- genes_of_interest[i]
+    t_test_result <- t.test(exprs_data[[gene]] ~ exprs_data$Treatment)
+    p_values[i] <- t_test_result$p.value
+}
+
+# Adjust p-values using the Benjamini-Hochberg (FDR) method
+adjusted_p_values <- p.adjust(p_values, method = "BH")
+
+results <- data.frame(
+    Gene = genes_of_interest,
+    Raw_p_value = p_values,
+    Adjusted_p_value = adjusted_p_values
+)
+
+# Non-responder (patient PARIS only)
+sce_nonresponder <- sce_nonresponder[, sce_nonresponder$Patient == "PARIS"]
+exprs_data <- as.data.frame(t(logcounts(sce_nonresponder)[genes_of_interest, ]))
+exprs_data$Treatment <- sce_nonresponder$Treatment
+exprs_data$Treatment <- factor(exprs_data$Treatment, levels = c("Pre-treatment", "Post-treatment"))
+
+for (i in seq_along(genes_of_interest)) {
+  
+  gene <- genes_of_interest[i]
+  t_test_result <- t.test(exprs_data[[gene]] ~ exprs_data$Treatment)
+  t_test_result
+  wilcox_test_result <- wilcox.test(exprs_data[[gene]] ~ exprs_data$Treatment)
+  
+  gg1 <- ggplot(exprs_data, aes_string(x="Treatment", y=genes_of_interest[i], fill="Treatment")) +
+    geom_violin(trim=TRUE) +
+    scale_fill_manual(values=colours_sample) +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          axis.title.x = element_blank(),
+          legend.title = element_blank()) +
+    labs(
+      title = paste0("p-value: ", signif(t_test_result$p.value, 3))
+    )
+  
+  print(gg1)
+}
+
+p_values <- numeric(length(genes_of_interest))
+for (i in seq_along(genes_of_interest)) {
+    gene <- genes_of_interest[i]
+    t_test_result <- t.test(exprs_data[[gene]] ~ exprs_data$Treatment)
+    p_values[i] <- t_test_result$p.value
+}
+
+# Adjust p-values using the Benjamini-Hochberg (FDR) method
+adjusted_p_values <- p.adjust(p_values, method = "BH")
+
+results <- data.frame(
+    Gene = genes_of_interest,
+    Raw_p_value = p_values,
+    Adjusted_p_value = adjusted_p_values
+)
+```
