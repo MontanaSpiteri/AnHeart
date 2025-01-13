@@ -33,6 +33,7 @@ All original code pertaining to analysis for the study is organised in the follo
 ### - Spatial_Transcriptomics: 10X Xenium spatial transcriptomics
 ### - snRNA-seq: 10X Chromium single nuclei RNA sequencing (5' single-end)
 ### - Methylation_Array: Infinium MethylationEPIC v2.0 BeadChip array
+### - Epigenetic: Histone Modifications LC-MS
 
 All raw and processed datasets are available from the lead contact upon request. 
 Any additional information required to reanalyze the data reported in the study is available from the lead contact upon request. 
