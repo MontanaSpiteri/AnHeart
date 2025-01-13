@@ -1,0 +1,163 @@
+---
+title: "Histone modifications investigation"
+output: html_document
+date: "2025-01-13"
+---
+
+The following code relates to the investigation of histone modifications data (epigenetic analyses).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(broom)
+library(purrr)
+library(tibble)
+library(pheatmap)
+
+cols <- c("#0C7BDC", "#E66100")
+names(cols) <- c("Pre-treatment", "Post-treatment")
+
+colours <- c("A-01" = "#00FFFF",
+             "A-02" = "#6A5ACD",
+             "A-03" = "#008080",
+             "A-04" = "#228B22",
+             "A-05" = "#4B0082",
+             "A-06" = "#90EE90",
+             "A-07" = "#8F00FF",
+             "O-01" = "#FF2400",
+             "O-02" = "#FFD700",
+             "O-03" = "#FF7F50")
+```
+
+* median normalisation was performed to deal with different loading amounts across samples
+* relative abundance of each PTM was then computed from these corrected values
+
+```{r}
+# load median normalised data
+data <- read.delim("/data/Histone/dataperc_rel_abund_bySite.tsv", row.names = 1)
+
+# rename colnames
+colnames(data) <- gsub("AnteTreat", "Pre-treatment", colnames(data))
+colnames(data) <- gsub("PostTreat", "Post-treatment", colnames(data))
+
+# remove NA rows
+data <- data[rowSums(is.na(data)) != ncol(data), ]
+```
+
+# Boxplots
+
+```{r}
+data$PTM <- rownames(data)
+
+df_long <- data %>%
+  pivot_longer(
+    cols = -PTM, 
+    names_to = c("Condition", "Patient"),
+    names_sep = "_",
+    values_to = "Value"
+  )
+
+df_long$Condition <- factor(df_long$Condition, levels = c("Pre-teatment", "Post-treatment"))
+
+# remove patient with low tumor purity
+df_long <- df_long[df_long$Patient != "A-04", ]
+
+for (i in unique(df_long$PTM)) {
+  gene_data <- df_long %>% filter(PTM == i)
+  
+  p <- ggplot(gene_data, aes(x = Condition, y = Value, colour = Patient)) +
+    geom_boxplot(aes(group = Condition, fill = Condition), alpha = 0.9, outlier.shape = NA) + 
+    geom_point(position = position_jitter(width = 0.28, height = 0), size = 3) +  
+    theme_classic() +
+    scale_colour_manual(values = colours) +
+    scale_fill_manual(values = cols) +
+    labs(
+      title = paste(i),
+      x = NULL,
+      y = "Relative abundance (median normalized)"
+    ) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  print(p)
+}
+
+#  pairwise t-test with Benjamini-Hochberg correction
+# remove incomplete pairs (NAs)
+df_long_filtered <- df_long %>%
+  group_by(PTM, Patient) %>%
+  filter(
+    all(!is.na(Value)) & n_distinct(Condition) == 2
+  ) %>%
+  ungroup()
+
+paired_ttest <- df_long_filtered %>%
+  split(.$PTM) %>%
+  map_df(.f = function(data_ptm) {
+    pairwise_result <- pairwise.t.test(
+      data_ptm$Value,
+      data_ptm$Condition,
+      p.adjust.method = "BH",
+      paired = TRUE
+    )
+    
+    tidy_result <- tidy(pairwise_result) %>%
+      mutate(
+        PTM = unique(data_ptm$PTM)
+        )
+    
+    return(tidy_result)
+  })
+```
+
+# logFC heatmap
+
+```{r}
+# remove grade 3 patient A-05
+df_long <- df_long[df_long$Patient != "A-05", ]
+
+# calculate log fold changes
+df_fc <- df_long %>%
+  group_by(PTM) %>%
+  summarize(
+    Condition1_Mean = mean(Value[Condition == "Pre-treatment"], na.rm = TRUE),
+    Condition2_Mean = mean(Value[Condition == "Post-treatment"], na.rm = TRUE)
+  ) %>%
+  mutate(
+    Fold_Change = log2((Condition2_Mean) / (Condition1_Mean))  # Positive value is up post-treatment
+  )
+
+df_fc <- df_fc %>%
+  mutate(
+    Histone_Mark = ifelse(grepl("me|ac", PTM),
+                          sub("(.*?)(me\\d*|ac).*", "\\1", PTM),
+                          PTM),
+    Modification = ifelse(grepl("me\\d*|ac", PTM),
+                          sub(".*?(me\\d*|ac).*", "\\1", PTM),
+                          "Unmodified")
+  )
+
+heatmap_data <- df_fc %>%
+  select(Histone_Mark, Modification, Fold_Change) %>%
+  pivot_wider(
+    names_from = Histone_Mark,
+    values_from = Fold_Change,
+    values_fill = 0
+  ) %>%
+  column_to_rownames("Modification")
+
+max_abs <- max(abs(heatmap_data), na.rm = TRUE)
+breaks <- seq(-max_abs, max_abs, length.out = 101)
+
+plot <- pheatmap(
+  heatmap_data,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  color = colorRampPalette(c("#0C7BDC", "white", "#E66100"))(100),
+  breaks = breaks,
+  fontsize_row = 10,
+  fontsize_col = 10
+)
+```
+
+
