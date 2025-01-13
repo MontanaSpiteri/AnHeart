@@ -1,0 +1,596 @@
+---
+title: "Cell type annotation of Xenium spatial transcriptomics data"
+output: html_document
+---
+
+The following code relates to the cell type annotation of Xenium spatial transcriptomics data.
+Each sample was annotated separately using this same script (Sample A-05_pre-treatment used as an example here).
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+library(Seurat)
+library(SeuratObject)
+library(SingleR)
+library(ggplot2)
+library(SingleCellExperiment)
+library(pals)
+library(intrinsicDimension)
+library(reticulate)
+library(readxl)
+library(viridis)
+library(dplyr)
+library(magrittr)
+library(BiocParallel)
+library(BiocNeighbors)
+library(BiocSingular)
+library(bluster)
+library(scater)
+library(scuttle)
+library(scran)
+library(org.Hs.eg.db)
+library(ggrepel)
+library(stringi)
+
+colours_anno <- c("#F28482", "#9D4EDD", "#6A994E", "#3A7CA5", "#EF233C",
+               "#F9C8C7", "#CDDEB9", "#A7C957", "#63A2C8", "#000000", "#FFEA00", "#F4F3EE",
+               "#FAA307", "#FFBA08", "#FFD60A", "#E85D04", "#F48C06", "#F2CC8F",
+               "#656D4A", "#A4AC86", "#B6AD90", "#7F4F24", "#A68A64", "#D6D1C1",
+               "#000000", "#ADB5BD",
+               "#9D0208")
+
+names(colours_anno) <- c("AC-like", "MES-like", "OPC-like", "NPC-like", "Progenitor",
+                      "Astrocyte", "Oligodendrocyte", "OPC", "Neuron", "Vasculature", "Immune", "Unknown",
+                      "T Cell", "NK Cell", "B Cell", "CD8 T Cell", "CD4 T Cell", "T Reg Cell", 
+                      "Dendritic Cell", "Neutrophil", "Monocyte", "Microglia", "Macrophage", "Mast Cell",
+                      "Endothelial", "Mural",
+                      "Death")
+
+## ruiz
+colours_pop <- Polychrome::palette36.colors(20)
+names(colours_pop) <- c("AC-like","Astrocyte","MES-like","Mural cell","Neuron","Oligodendrocyte","OPC","OPC-like","RG","Endothelial","NPC-like", "Mono", "TAM-BDM", "TAM-MG", "DC", "Mast", "CD4/CD8", "NK", "B Cell", "Plasma B")
+## couturier
+colours_popC <- Polychrome::palette36.colors(6)
+names(colours_popC) <- c("Astro","Mesenchymal","Neuronal","Oligo","Progenitor","Unassigned")
+```
+
+# Load Data
+
+```{r}
+spe <- readRDS("/data/process/spe_A-05_pre-treatment_processed.rds")
+```
+
+# Clusters
+
+```{r, echo=FALSE}
+df <- reducedDim(spe, "UMAP")
+df <- as.data.frame(df)
+df$Sample <- spe$sample
+df$Cluster <- spe$Cluster
+
+colours_clusters <- Polychrome::palette36.colors(12)
+names(colours_clusters) <- 1:12
+
+ggplot(df[sample(1:nrow(df)),], aes(x=UMAP1, y=UMAP2, color=Cluster)) + geom_point(alpha=0.5) + 
+  theme_classic() +
+guides(colour = guide_legend(override.aes = list(alpha = 1, size=3))) + scale_color_manual(values=colours_clusters)
+```
+
+# Annotation
+
+Automatic reference-based SingleR annotation
+
+References used:
+
+* Ruiz-Moreno et al. 2022
+* Couturier et al. 2020
+* Herring et al. 2022 (Lister)
+
+Gene inputs used for annotation:
+
+* Reference dataset HVGs
+
+```{r}
+# load reference datasets 
+sc_gbm_big <- readRDS("/public_datasets/sc_gbm_big/sce_downsampled.rds")
+couturier <- readRDS("/public_datasets/Deconvolution References/Couturier_dataset_tumor_lognormalised.rds")
+reference <- readRDS("/public_datasets/lister/2020-12-18_whole-tissue_post-restaged-GABA-clustering.RDS")
+reference$concat <- paste(reference$major_clust, reference$stage_ids, sep = "_")
+
+# gene inputs
+ReferenceHVGs <- function(x, symbol="feature_name"){
+  rownames(x) <- rowData(x)[,symbol]
+  dec <- modelGeneVar(x)
+  Reference_HVGs <- getTopHVGs(dec, n=5000)
+  return(Reference_HVGs)
+}
+
+reference.HVGs <- ReferenceHVGs(sc_gbm_big)
+reference.HVGsC <- ReferenceHVGs(couturier, symbol = "Symbol")
+reference.HVGsL <- ReferenceHVGs(reference, symbol = "index")
+
+# function
+annotate_clust <- function(sce, reference, genes, symbol="feature_name", annotation="annotation_level_3"){
+  
+  #Check for excessive amount of Ensembl gene names 
+  is.ens <- grepl("^ENSG", genes, ignore.case = TRUE)
+  num.true <- length(is.ens[is.ens == TRUE])
+  if(num.true == length(genes)){
+    print(warning("Ensembl genes detected in gene names"))
+  }
+  
+  #Check Marker Genes are actually present in dataset of interest
+  is.present <- genes %in% rownames(sce)
+  num.false <- length(is.present[is.present == FALSE])
+  if(num.false > 0){
+    print(warning("Marker genes not present in dataset of interest. Possibly wrongly named"))
+  }
+  
+  #Annotate clusters using reference dataset
+  counts(reference) <- logcounts(reference)
+  rownames(reference) <- rowData(reference)[,symbol]
+  available <- intersect(rownames(reference), rownames(sce))
+  pred_labels <- SingleR(test=sce[available,], ref=reference[available,], restrict = genes, 
+                         labels=colData(reference)[,annotation], de.method="wilcox")
+  return(pred_labels$pruned.labels)
+}
+
+# run
+anno <- annotate_clust(sce = spe, reference = sc_gbm_big, genes = reference.HVGs)
+annoC <- annotate_clust(sce = spe, reference = couturier, genes = reference.HVGsC, symbol = "Symbol", annotation = "cluster")
+annoL <- annotate_clust(sce = spe, reference = reference, genes = reference.HVGsL, symbol = "index", annotation = "concat")
+
+spe$anno_ruiz <- anno
+spe$anno_cout <- annoC
+spe$anno_lister <- annoL
+
+gc()
+```
+
+```{r, echo=FALSE}
+## ruiz
+plotReducedDim(object = spe, dimred = "UMAP", colour_by = "anno_ruiz") + theme(aspect.ratio = 1)+ ggtitle("Ruiz-Moreno Annotation")+
+  scale_color_manual(values=colours_pop)
+## couturier
+plotReducedDim(object = spe, dimred = "UMAP", colour_by = "anno_cout") + theme(aspect.ratio = 1)+ ggtitle("Couturier Annotation")+
+  scale_color_manual(values=colours_popC)
+```
+
+```{r, echo=FALSE}
+# Astro and Microglia and Oligo
+spe_subset <- spe
+astro_or_micro_cells <- grepl("^Astro", spe_subset$anno_lister) | grepl("^Micro", spe_subset$anno_lister) | grepl("^Oligo", spe_subset$anno_lister)
+colData(spe_subset)$anno_lister[!astro_or_micro_cells] <- "Other_celltype"
+
+plotReducedDim(object = spe_subset, dimred = "UMAP", colour_by = "anno_lister") + theme(aspect.ratio = 1)+ ggtitle("Lister Astro, Microglia & Oligo Cells")
+```
+
+## Inspect Marker Genes
+
+```{r, include=FALSE}
+# Inspect marker genes
+markers <- function(x, marker){
+  x$marker <- as.vector(logcounts(x[marker,]))
+  plot <- plotReducedDim(object = x, dimred = "UMAP", colour_by = marker) + theme(aspect.ratio = 1)+ ggtitle(marker)+
+  scale_color_viridis_c()
+  return(plot)
+}
+```
+
+### AC-like
+
+```{r, echo=FALSE}
+marker_genes <- c("APOE","AQP4", "MGAT4C")
+lapply(marker_genes, function(marker) markers(spe, marker))
+```
+
+### MES-like
+
+```{r, echo=FALSE}
+marker_genes <- c("PDGFRA", "CHI3L1")
+lapply(marker_genes, function(marker) markers(spe, marker))
+```
+
+### OPC-like
+
+```{r, echo=FALSE}
+marker_genes <- c("APOD", "OLIG1", "OLIG2")
+lapply(marker_genes, function(marker) markers(spe, marker))
+```
+
+### Progenitor
+
+```{r, echo=FALSE}
+marker_genes <- c("TOP2A", "MKI67")
+lapply(marker_genes, function(marker) markers(spe, marker))
+```
+
+### NPC-like
+
+```{r, echo=FALSE}
+marker_genes <- c("SOX11", "HES6", "STMN2")
+lapply(marker_genes, function(marker) markers(spe, marker))
+```
+
+### Neuron
+
+```{r}
+marker_genes <- c("NPTXR", "STMN2", "CDH13", "C1QL3")
+lapply(marker_genes, function(marker) markers(spe, marker))
+```
+
+### Vasculature
+
+```{r, echo=FALSE}
+marker_genes <- c("IGFBP7", "DCN")
+lapply(marker_genes, function(marker) markers(spe, marker))
+```
+
+### Astrocyte
+
+```{r, echo=FALSE}
+marker_genes <- c("MGST1", "NTRK2")
+lapply(marker_genes, function(marker) markers(spe, marker))
+```
+
+### Oligodendrocyte
+
+```{r, echo=FALSE}
+marker_genes <- c("ERMN", "MBP")
+lapply(marker_genes, function(marker) markers(spe, marker))
+```
+
+### Immune Markers
+
+```{r, echo=FALSE}
+# Immune Markers
+
+## T Cell
+marker_genes <- c("CD4", "CD8A", "CCR7", "CD27", "PTPRC", "CD28", "KLRB1", "CD69", "FOXP3")
+lapply(marker_genes, function(marker) markers(spe, marker))
+## B-cells
+marker_genes <- c("CD19", "CD79A", "BANK1")
+lapply(marker_genes, function(marker) markers(spe, marker))
+## Macrophage
+marker_genes <- c("CD163", "CD68")
+lapply(marker_genes, function(marker) markers(spe, marker))
+## Neutrophil
+marker_genes <- c("ITGAX", "SLC11A1", "CXCR1")
+lapply(marker_genes, function(marker) markers(spe, marker))
+## Monocyte
+marker_genes <- c("VCAN", "FCER1G", "CD14")
+lapply(marker_genes, function(marker) markers(spe, marker))
+## Dendritic Cell
+marker_genes <- c("FCER1A", "S100A4", "HLA-DQA1", "HLA-DQB1")
+lapply(marker_genes, function(marker) markers(spe, marker))
+## NK cells
+marker_genes <- c("KLRC1", "GNLY") 
+lapply(marker_genes, function(marker) markers(spe, marker))
+## Microglia
+marker_genes <- c("P2RY12", "CX3CR1")
+lapply(marker_genes, function(marker) markers(spe, marker))
+```
+
+## Final Annotation
+
+```{r, echo=FALSE}
+# Final annotation
+annotation_df <- read.csv(file = "/data/process/A-05_pre-treatment_annotations.csv")
+spe$annotation <- annotation_df$annotation[match(spe$Cluster, annotation_df$cluster)]
+spe$annotation <- factor(spe$annotation)
+df$annotation <- spe$annotation
+
+ggplot(df[sample(1:nrow(df)),], aes(x=UMAP1, y=UMAP2, color=annotation)) + geom_point(alpha=0.5) + 
+  theme_classic() + labs(title = "A-05_pre-treatment")+
+guides(colour = guide_legend(override.aes = list(alpha = 1, size=3))) + scale_color_manual(values=colours_anno) 
+
+df %>%
+  dplyr::count(annotation, Sample) %>%       
+  dplyr::group_by(Sample) %>%
+  dplyr::mutate(pct= prop.table(n) * 100) %>%
+  ggplot(aes(y=Sample, x=pct, fill=annotation)) +
+  geom_bar(stat="identity") +
+  theme_bw()+ scale_fill_manual(values=colours_anno) 
+
+#saveRDS(spe, file = "/data/process/spe_A-05_pre-treatment_processed.rds")
+```
+
+## Investigate/re-cluster NPC-like population
+
+Are there normal neurons hiding here?
+
+```{r}
+spe_npc <- spe[, spe$annotation == "NPC-like"]
+
+# re-cluster
+set.seed(0010101010)
+spe_npc <- runPCA(spe_npc, ncomponents=50,
+    BSPARAM=BiocSingular::IrlbaParam(),  BPPARAM=MulticoreParam(10))
+
+dim_est <- maxLikGlobalDimEst(reducedDim(spe_npc, "PCA"), k=20, unbiased=TRUE)
+dim_est <- ceiling(dim_est$dim.est)
+
+reducedDim(spe_npc, "PCA") <- reducedDim(spe_npc, "PCA")[,1:dim_est] 
+
+set.seed(0010101010)
+spe_npc <- runUMAP(spe_npc, dimred="PCA", name = 'UMAP',
+   BPPARAM=MulticoreParam(10), spread = 1, min_dist = 0.1)
+
+scater::plotReducedDim(spe_npc, dimred = "UMAP", color_by = "sample")
+
+set.seed(0010101010)
+clust.leiden <- clusterCells(spe_npc, use.dimred="PCA", 
+    BLUSPARAM=SNNGraphParam(k=29, type="rank", cluster.fun="leiden"))
+table(clust.leiden)
+colData(spe_npc)$Cluster_npc <- clust.leiden
+
+scater::plotReducedDim(spe_npc, dimred = "UMAP", color_by = "Cluster_npc")
+
+# NPC-like
+marker_genes <- c("SOX11", "HES6", "STMN2", "SOX4")
+lapply(marker_genes, function(marker) markers(spe_npc, marker))
+
+# Neuron
+marker_genes <- c("NPTXR", "CDH13", "C1QL3", "EPHA4", "LMO4", "NRN1", "SPOCK3")
+lapply(marker_genes, function(marker) markers(spe_npc, marker))
+
+plotReducedDim(object = spe_npc, dimred = "UMAP", colour_by = "anno_cout") + theme(aspect.ratio = 1)+ ggtitle("Couturier Annotation")+
+  scale_color_manual(values=colours_popC)
+plotReducedDim(object = spe_npc, dimred = "UMAP", colour_by = "anno_ruiz") + theme(aspect.ratio = 1)+ ggtitle("Ruiz-Moreno Annotation")+
+  scale_color_manual(values=colours_pop)
+
+# Progenitor
+marker_genes <- c("TOP2A", "MKI67")
+lapply(marker_genes, function(marker) markers(spe_npc, marker))
+
+annotation_df <- read.csv(file = "/data/process/A-05_pre-treatment_npc_anno.csv")
+spe_npc$annotation <- annotation_df$annotation[match(spe_npc$Cluster_npc, annotation_df$cluster)]
+spe_npc$annotation <- factor(spe_npc$annotation)
+scater::plotReducedDim(spe_npc, dimred = "UMAP", color_by = "annotation")
+
+# update annotations
+levels(spe$annotation) <- union(levels(spe$annotation), unique(spe_npc$annotation))
+colData(spe)$annotation[match(colnames(spe_npc), colnames(spe))] <- spe_npc$annotation
+```
+
+## Investigate/re-cluster AC-like population
+
+Are there normal astrocytes hiding here?
+
+```{r}
+spe_ac <- spe[, spe$annotation == "AC-like"]
+
+# re-cluster
+set.seed(0010101010)
+spe_ac <- runPCA(spe_ac, ncomponents=50,
+    BSPARAM=BiocSingular::IrlbaParam(),  BPPARAM=MulticoreParam(10))
+
+dim_est <- maxLikGlobalDimEst(reducedDim(spe_ac, "PCA"), k=20, unbiased=TRUE)
+dim_est <- ceiling(dim_est$dim.est)
+
+reducedDim(spe_ac, "PCA") <- reducedDim(spe_ac, "PCA")[,1:dim_est] 
+
+set.seed(0010101010)
+spe_ac <- runUMAP(spe_ac, dimred="PCA", name = 'UMAP',
+   BPPARAM=MulticoreParam(10), spread = 1, min_dist = 0.1)
+
+scater::plotReducedDim(spe_ac, dimred = "UMAP", color_by = "sample")
+
+set.seed(0010101010)
+clust.leiden <- clusterCells(spe_ac, use.dimred="PCA", 
+    BLUSPARAM=SNNGraphParam(k=38, type="rank", cluster.fun="leiden"))
+table(clust.leiden)
+colData(spe_ac)$Cluster_ac <- clust.leiden
+
+scater::plotReducedDim(spe_ac, dimred = "UMAP", color_by = "Cluster_ac")
+
+# AC-like
+marker_genes <- c("APOE","AQP4", "MGAT4C")
+lapply(marker_genes, function(marker) markers(spe_ac, marker))
+
+# Astrocyte
+marker_genes <- c("MGST1", "NTRK2", "FGFR3", "GJA1", "TTYH1", "CST3")
+lapply(marker_genes, function(marker) markers(spe_ac, marker))
+
+plotReducedDim(object = spe_ac, dimred = "UMAP", colour_by = "anno_ruiz") + theme(aspect.ratio = 1)+ ggtitle("Ruiz-Moreno Annotation")+
+  scale_color_manual(values=colours_pop)
+
+# lister
+colData(spe_ac)$anno_lister[!grepl("^Astro", spe_ac$anno_lister) ] <- "Other_celltype"
+plotReducedDim(object = spe_ac, dimred = "UMAP", colour_by = "anno_lister") + theme(aspect.ratio = 1)
+
+annotation_df <- read.csv(file = "/data/process/A-05_pre-treatment_ac_anno.csv")
+spe_ac$annotation <- annotation_df$annotation[match(spe_ac$Cluster_ac, annotation_df$cluster)]
+spe_ac$annotation <- factor(spe_ac$annotation)
+scater::plotReducedDim(spe_ac, dimred = "UMAP", color_by = "annotation")
+
+# update annotations
+levels(spe$annotation) <- union(levels(spe$annotation), unique(spe_ac$annotation))
+colData(spe)$annotation[match(colnames(spe_ac), colnames(spe))] <- spe_ac$annotation
+```
+
+## Investigate/re-cluster Immune population
+
+Tease apart Immune sub-populations
+
+```{r}
+spe_im <- spe[, spe$annotation == "Immune"]
+
+# re-cluster
+set.seed(0010101010)
+spe_im <- runPCA(spe_im, ncomponents=50,
+    BSPARAM=BiocSingular::IrlbaParam(),  BPPARAM=MulticoreParam(10))
+
+dim_est <- maxLikGlobalDimEst(reducedDim(spe_im, "PCA"), k=20, unbiased=TRUE)
+dim_est <- ceiling(dim_est$dim.est)
+
+reducedDim(spe_im, "PCA") <- reducedDim(spe_im, "PCA")[,1:dim_est] 
+
+set.seed(0010101010)
+spe_im <- runUMAP(spe_im, dimred="PCA", name = 'UMAP',
+   BPPARAM=MulticoreParam(10), spread = 1, min_dist = 0.1)
+
+scater::plotReducedDim(spe_im, dimred = "UMAP", color_by = "sample")
+
+set.seed(0010101010)
+clust.leiden <- clusterCells(spe_im, use.dimred="PCA", 
+    BLUSPARAM=SNNGraphParam(k=21, type="rank", cluster.fun="leiden"))
+table(clust.leiden)
+colData(spe_im)$Cluster_im <- clust.leiden
+
+scater::plotReducedDim(spe_im, dimred = "UMAP", color_by = "Cluster_im")
+
+## T Cell
+marker_genes <- c("CD4", "CD8A", "CCR7", "CD27", "PTPRC", "CD28", "KLRB1", "CD69", "FOXP3")
+lapply(marker_genes, function(marker) markers(spe_im, marker))
+## B-cells
+marker_genes <- c("CD19", "CD79A", "BANK1")
+lapply(marker_genes, function(marker) markers(spe_im, marker))
+## Macrophage
+marker_genes <- c("CD163", "CD68")
+lapply(marker_genes, function(marker) markers(spe_im, marker))
+## Neutrophil
+marker_genes <- c("ITGAX", "SLC11A1", "CXCR1")
+lapply(marker_genes, function(marker) markers(spe_im, marker))
+## Monocyte
+marker_genes <- c("VCAN", "FCER1G", "CD14")
+lapply(marker_genes, function(marker) markers(spe_im, marker))
+## Dendritic Cell
+marker_genes <- c("FCER1A", "S100A4", "HLA-DQA1", "HLA-DQB1")
+lapply(marker_genes, function(marker) markers(spe_im, marker))
+## NK cells
+marker_genes <- c("KLRC1", "GNLY") 
+lapply(marker_genes, function(marker) markers(spe_im, marker))
+## Microglia
+marker_genes <- c("P2RY12", "CX3CR1")
+lapply(marker_genes, function(marker) markers(spe_im, marker))
+
+annotation_df <- read.csv(file = "/data/process/A-05_pre-treatment_immune_anno.csv")
+spe_im$annotation <- annotation_df$annotation[match(spe_im$Cluster_im, annotation_df$cluster)]
+spe_im$annotation <- factor(spe_im$annotation)
+scater::plotReducedDim(spe_im, dimred = "UMAP", color_by = "annotation")
+
+# update annotations
+levels(spe$annotation) <- union(levels(spe$annotation), unique(spe_im$annotation))
+colData(spe)$annotation[match(colnames(spe_im), colnames(spe))] <- spe_im$annotation
+```
+
+## Investigate/re-cluster Neuron population
+
+Tease apart Neuron sub-populations
+
+```{r}
+spe_neuron <- spe[, spe$annotation == "Neuron"]
+
+# re-cluster
+set.seed(0010101010)
+spe_neuron <- runPCA(spe_neuron, ncomponents=50,
+    BSPARAM=BiocSingular::IrlbaParam(),  BPPARAM=MulticoreParam(10))
+
+dim_est <- maxLikGlobalDimEst(reducedDim(spe_neuron, "PCA"), k=20, unbiased=TRUE)
+dim_est <- ceiling(dim_est$dim.est)
+
+reducedDim(spe_neuron, "PCA") <- reducedDim(spe_neuron, "PCA")[,1:dim_est] 
+
+set.seed(0010101010)
+spe_neuron <- runUMAP(spe_neuron, dimred="PCA", name = 'UMAP',
+   BPPARAM=MulticoreParam(10), spread = 1, min_dist = 0.1)
+
+scater::plotReducedDim(spe_neuron, dimred = "UMAP", color_by = "sample")
+
+set.seed(0010101010)
+clust.leiden <- clusterCells(spe_neuron, use.dimred="PCA", 
+    BLUSPARAM=SNNGraphParam(k=21, type="rank", cluster.fun="leiden"))
+table(clust.leiden)
+colData(spe_neuron)$Cluster_n <- clust.leiden
+
+scater::plotReducedDim(spe_neuron, dimred = "UMAP", color_by = "Cluster_n")
+
+# Neuron
+marker_genes <- c("NPTXR", "STMN2", "CDH13", "C1QL3", "EPHA4", "LMO4", "NRN1", "SPOCK3")
+lapply(marker_genes, function(marker) markers(spe_neuron, marker))
+
+genes <- read_xlsx("deconvolution_signatures/neuron_subtype_markers.xlsx")
+genes <- genes[genes$gene %in% rownames(spe_neuron), ]
+
+# Excitatory Neuron
+marker_genes <- genes[genes$cell_type == "Excitatory Neuron", ]
+marker_genes <- marker_genes$gene
+lapply(marker_genes, function(marker) markers(spe_neuron, marker))
+
+# Inhibitory Neuron
+marker_genes <- genes[genes$cell_type == "Inhibitory Neuron", ]
+marker_genes <- marker_genes$gene
+lapply(marker_genes, function(marker) markers(spe_neuron, marker))
+
+annotation_df <- read.csv(file = "/data/process/A-05_pre-treatment_neuron_anno.csv")
+spe_neuron$annotation <- annotation_df$annotation[match(spe_neuron$Cluster_n, annotation_df$cluster)]
+spe_neuron$annotation <- factor(spe_neuron$annotation)
+scater::plotReducedDim(spe_neuron, dimred = "UMAP", color_by = "annotation")
+
+# update annotations
+levels(spe$annotation) <- union(levels(spe$annotation), unique(spe_neuron$annotation))
+colData(spe)$annotation[match(colnames(spe_neuron), colnames(spe))] <- spe_neuron$annotation
+
+scater::plotReducedDim(spe, dimred = "UMAP", color_by = "annotation")
+
+## refine excitatory neurons
+spe_neuron <- spe[, spe$annotation == "Excitatory Neuron"]
+
+# re-cluster
+set.seed(0010101010)
+spe_neuron <- runPCA(spe_neuron, ncomponents=50,
+    BSPARAM=BiocSingular::IrlbaParam(),  BPPARAM=MulticoreParam(10))
+
+dim_est <- maxLikGlobalDimEst(reducedDim(spe_neuron, "PCA"), k=20, unbiased=TRUE)
+dim_est <- ceiling(dim_est$dim.est)
+
+reducedDim(spe_neuron, "PCA") <- reducedDim(spe_neuron, "PCA")[,1:dim_est] 
+
+set.seed(0010101010)
+spe_neuron <- runUMAP(spe_neuron, dimred="PCA", name = 'UMAP',
+   BPPARAM=MulticoreParam(10), spread = 1, min_dist = 0.1)
+
+scater::plotReducedDim(spe_neuron, dimred = "UMAP", color_by = "sample")
+
+set.seed(0010101010)
+clust.leiden <- clusterCells(spe_neuron, use.dimred="PCA", 
+    BLUSPARAM=SNNGraphParam(k=15, type="rank", cluster.fun="leiden"))
+table(clust.leiden)
+colData(spe_neuron)$Cluster_n <- clust.leiden
+
+scater::plotReducedDim(spe_neuron, dimred = "UMAP", color_by = "Cluster_n")
+
+# Excitatory Neuron
+marker_genes <- genes[genes$cell_type == "Excitatory Neuron", ]
+marker_genes <- marker_genes$gene
+lapply(marker_genes, function(marker) markers(spe_neuron, marker))
+
+# Inhibitory Neuron
+marker_genes <- genes[genes$cell_type == "Inhibitory Neuron", ]
+marker_genes <- marker_genes$gene
+lapply(marker_genes, function(marker) markers(spe_neuron, marker))
+
+annotation_df <- read.csv(file = "/data/process/A-05_pre-treatment_excitatory_anno.csv")
+spe_neuron$annotation <- annotation_df$annotation[match(spe_neuron$Cluster_n, annotation_df$cluster)]
+spe_neuron$annotation <- factor(spe_neuron$annotation)
+scater::plotReducedDim(spe_neuron, dimred = "UMAP", color_by = "annotation")
+
+# update annotations
+levels(spe$annotation) <- union(levels(spe$annotation), unique(spe_neuron$annotation))
+colData(spe)$annotation[match(colnames(spe_neuron), colnames(spe))] <- spe_neuron$annotation
+
+scater::plotReducedDim(spe, dimred = "UMAP", color_by = "annotation")
+```
+
+# Final cell type annotations
+
+```{r}
+df$annotation <- spe$annotation
+
+ggplot(df[sample(1:nrow(df)),], aes(x=UMAP1, y=UMAP2, color=annotation)) + geom_point(alpha=0.5) + 
+  theme_classic() + labs(title = "A-05_pre-treatment")+
+guides(colour = guide_legend(override.aes = list(alpha = 1, size=3))) + scale_color_manual(values=colours_anno) 
+
+saveRDS(spe, file = "/data/process/spe_A-05_pre-treatment_processed.rds")
+```
+
