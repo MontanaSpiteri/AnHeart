@@ -1,0 +1,270 @@
+---
+title: "Independent LGG cohort analysis (snRNA-seq data)"
+output: html_document
+date: "2025-01-10"
+---
+
+The following code relates to the analysis of snRNA-seq data from an independent cohort of low-grade glioma (n = 3 Oligodendroglioma, n = 8 Astrocytoma).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(SummarizedExperiment)
+library(HDF5Array)
+library(SingleCellExperiment)
+library(intrinsicDimension)
+library(scater)
+library(scuttle)
+library(BiocParallel)
+library(SCENT)
+library(destiny)
+library(diptest)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(scran)
+library(limma)
+library(ggrepel)
+library(tidyverse)
+library(reshape2)
+library(BiocParallel)
+library(bluster)
+library(fgsea)
+library(pheatmap)
+library(lme4)
+library(edgeR)
+library(zoo)
+library(Seurat)
+library(GOSemSim)
+library(UpSetR)
+library(numbat)
+library(CytoTRACE2)
+library(entropy)
+library(reticulate)
+
+# Load colours 
+colours_comb <- c("#F28482", "#9D4EDD", "#6A994E", "#3A7CA5", "#EF233C",
+               "#F9C8C7", "#CDDEB9", "#A7C957", "#63A2C8", "#10F4B9", "#d8e5e5", "#ADD8E6", "#89CFF0", "#6495ED", "#9CFDFF", "#000000", "#FFEA00", "#F4F3EE",
+               "#FAA307", "#FFBA08", "#FFD60A", "#E85D04", "#F48C06", "#F2CC8F",
+               "#656D4A", "#A4AC86", "#B6AD90", "#7F4F24", "#A68A64", "#D6D1C1",
+               "#000000", "#ADB5BD",
+               "#9D0208", "#8c0001", "#ffabff")
+names(colours_comb) <- c("AC-like", "MES-like", "OPC-like", "NPC-like", "Progenitor",
+                      "Astrocyte", "Oligodendrocyte", "OPC", "Neuron", "Excitatory Neuron", "PN-dev", "PN-L2/3", "PN-L4", "PN-L5/6", "Inhibitory Neuron", "Vasculature", "Immune", "Unknown",
+                      "T Cell", "NK Cell", "B Cell", "CD8 T Cell", "CD4 T Cell", "T Reg Cell", 
+                      "Dendritic Cell", "Neutrophil", "Monocyte", "Microglia", "Macrophage", "Mast Cell",
+                      "Endothelial", "Mural",
+                      "Death", "Tumor", "Normal")
+
+colour_sample <- c("A-A"= "#3498DB", "O-A" = "#E74C3C", "A-B" = "#1ABC9C", "A-C" = "#2ECC71", "A-D" = "#9B59B6", "O-B" = "#F39C12", "O-C" = "#E67E22", "A-E" = "#34495E", "A-F" = "#5DADE2", "A-G" = "#48C9B0", "A-H" = "#85C1E9")
+```
+
+# Load dataset
+
+```{r}
+sce <- readRDS("/data/processed/sce_lgg.rds")
+
+df <- as.data.frame(reducedDim(sce, "scvi_UMAP"))
+colnames(df) <- c("UMAP1", "UMAP2")
+df$sample <- sce$Sample
+df$annotation <- sce$Anno2
+
+samp1 <- sample(1:nrow(df))
+themes <- theme_void()
+
+ggplot(df[samp1,], aes(x=UMAP1[samp1], y=UMAP2[samp1])) + 
+      geom_point(col="black", size=0.9) +
+      geom_point(col="white", size=0.5) +
+      geom_point(aes(col=annotation[samp1]), size=0.455, alpha=0.75) +
+      scale_color_manual(values=colours_comb) + themes +
+      guides(colour = guide_legend(override.aes = list(alpha = 1, size=3)))
+
+glycolysis_genes <- glycolysis_genes[glycolysis_genes %in% rownames(sce)]
+
+# remove unwanted annotations
+sce <- sce[, !sce$Anno2 %in% c("Poor Quality AC-like", "Poor Quality Microglia", "Unknown")]
+
+# append metadata
+meta <- read.csv("/data/meta/lgg_meta.csv")
+for (i in setdiff(colnames(meta), "X")) {
+  colData(sce)[[i]] <- meta[match(sce$Sample, meta$X), i]
+}
+
+sce$Diagnosis <- ifelse(grepl("A", sce$grade), 
+                         "Astrocytoma", 
+                         ifelse(grepl("O", sce$grade), 
+                                "Oligodendroglioma", 
+                                NA))
+sce$Diagnosis <- as.factor(sce$Diagnosis)
+```
+
+```{r}
+# Plot UMAPs
+sce$Anno2[sce$Anno2 %in% c("M1 Macrophage", "M2 Macrophage", "CD8 T Cell", "NK Cell", "Monocyte", "B Cell", "Immunosuppressive Microglia", "CD4 T Cell", "Microglia", "Neutrophil", "Activated Microglia")] <- "Immune"
+sce$Anno2[sce$Anno2 %in% c("Excitatory", "CGE", "MGE")] <- "Neuron"
+sce$Anno2[sce$Anno2 %in% c("Endothelial", "Mural", "Fibroblast")] <- "Vasculature"
+
+df <- as.data.frame(reducedDim(sce, "scvi_UMAP"))
+colnames(df) <- c("UMAP1", "UMAP2")
+df$sample <- sce$Sample
+df$annotation <- sce$Anno2
+
+samp1 <- sample(1:nrow(df))
+themes <- theme_void()
+
+plot <- ggplot(df[samp1,], aes(x=UMAP1[samp1], y=UMAP2[samp1])) + 
+      geom_point(col="black", size=0.9) +
+      geom_point(col="white", size=0.5) +
+      geom_point(aes(col=annotation[samp1]), size=0.455, alpha=0.75) +
+      scale_color_manual(values=colours_comb) + themes +
+      guides(colour = guide_legend(override.aes = list(alpha = 1, size=3)))
+
+plot <- ggplot(df[samp1,], aes(x=UMAP1[samp1], y=UMAP2[samp1])) + 
+      geom_point(col="black", size=0.9) +
+      geom_point(col="white", size=0.5) +
+      geom_point(aes(col=sample[samp1]), size=0.455, alpha=0.75) +
+      scale_color_manual(values=colour_sample) + themes +
+      guides(colour = guide_legend(override.aes = list(alpha = 1, size=3)))
+```
+
+```{r}
+# now only keep cell types of interest
+sce <- sce[, sce$Anno2 %in% c("AC-like", "OPC-like", "Oligodendrocyte", "Progenitor", "OPC", "Astrocyte")]
+```
+
+# Glycolysis per cell-type
+
+```{r}
+gene_sets <- readRDS("/public_datasets/gene_sets/all_genesets_list.rds")
+interest <- gene_sets[grep("GOBP_GLYCOLYTIC_PROCESS", names(gene_sets))]
+interest <- interest[[1]]
+
+# top genes according to ChatGPT - enzymes that catalyze each step
+glycolysis_genes <- c("HK1", "HK2", "HK3", "GPI", "PFKL", "PFKM", "PFKP", 
+                      "ALDOA", "ALDOB", "ALDOC", "TPI1", "GAPDH", "GAPDHS", 
+                      "PGK1", "PGK2", "PGAM1", "PGAM2", "PGAM4", "ENO1", 
+                      "ENO2", "ENO3", "PKM", "PKLR")
+```
+
+```{r}
+sce_glycolysis <- sce[glycolysis_genes, ]
+sce$glycolysis_score <- colMeans(logcounts(sce_glycolysis))
+
+plot_data <- data.frame(
+  Anno = sce$Anno2,
+  Glycolysis_Score = sce$glycolysis_score,
+  Patient = sce$Sample
+)
+
+plot_data_summary <- plot_data %>%
+  group_by(Anno, Patient) %>%
+  summarise(Glycolysis_Score = mean(Glycolysis_Score, na.rm = TRUE), .groups = 'drop')
+
+plot <- ggplot(plot_data_summary, aes(x = Anno, y = Glycolysis_Score, color = Patient)) +
+  geom_boxplot(aes(group = Anno, fill = Anno), alpha = 0.9, outlier.shape = NA) + 
+  geom_point(position = position_jitter(width = 0.28, height = 0), size = 2) +  
+  labs(title = "Glycolysis",
+       x = NULL,
+       y = "Average Log Expression (Glycolysis)") +
+  theme_classic() + 
+  scale_color_manual(values = colours_comb) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_colour_manual(values = colour_sample) +
+  scale_fill_manual(values = colours_comb) 
+```
+
+```{r}
+# significance of glycolysis enrichment
+#AC-like against all others (excluding astrocyte)
+plot_data_filtered <- plot_data_summary %>%
+  filter(Anno != "Astrocyte")
+
+group_A <- plot_data_filtered %>% 
+  filter(Anno == "AC-like") %>% 
+  pull(Glycolysis_Score)
+
+group_Other <- plot_data_filtered %>% 
+  filter(Anno != "AC-like") %>% 
+  pull(Glycolysis_Score)
+
+t_test <- t.test(group_A, group_Other, var.equal = FALSE)
+adjusted_p <- p.adjust(t_test$p.value, method = "fdr")
+
+
+#Astrocyte against all others (excluding AC-like)
+plot_data_filtered <- plot_data_summary %>%
+  filter(Anno != "AC-like")
+
+group_A <- plot_data_filtered %>% 
+  filter(Anno == "Astrocyte") %>% 
+  pull(Glycolysis_Score)
+
+group_Other <- plot_data_filtered %>% 
+  filter(Anno != "Astrocyte") %>% 
+  pull(Glycolysis_Score)
+
+t_test <- t.test(group_A, group_Other, var.equal = FALSE)
+adjusted_p <- p.adjust(t_test$p.value, method = "fdr")
+
+# compare all cell types
+t_test_results <- pairwise.t.test(plot_data$Glycolysis_Score, plot_data$Anno, p.adjust.method = "BH")
+t_test_results
+```
+
+# AC-like vs OPC-like Ternary metabolism plots
+
+```{r}
+# Krebs
+interest <- gene_sets[grep("GOBP_TRICARBOXYLIC_ACID_CYCLE", names(gene_sets))]
+interest <- interest[[1]]
+# top genes according to ChatGPT 
+krebs_genes <- c("CS", "IDH1", "IDH2", "IDH3A", "IDH3B", "IDH3G", "OGDH", "OGDHL", "SDHA", "SDHB", "SDHC", "SDHD", "FH", "MDH1", "MDH2")
+krebs_genes <- krebs_genes[krebs_genes %in% rownames(sce)]
+
+# Lactate
+interest <- gene_sets[grep("GOBP_LACTATE_METABOLIC_PROCESS", names(gene_sets))]
+lactate_genes <- interest[[1]]
+lactate_genes <- lactate_genes[lactate_genes %in% rownames(sce)]
+
+sce$glycolysis_score <- colMeans(logcounts(sce[glycolysis_genes, ]))
+sce$krebs_score <- colMeans(logcounts(sce[krebs_genes, ]))
+sce$lactate_score <- colMeans(logcounts(sce[lactate_genes, ]))
+
+plot_data <- data.frame(
+  CellType = sce$Anno2,
+  Glycolysis = sce$glycolysis_score,
+  Krebs = sce$krebs_score,
+  Lactate = sce$lactate_score,
+  Patient = sce$Sample
+)
+
+# Normalise scores sum to 1 for each cell
+plot_data <- transform(plot_data, Total = Glycolysis + Krebs + Lactate)
+plot_data <- transform(plot_data,
+                       Glycolysis = Glycolysis / Total,
+                       Krebs = Krebs / Total,
+                       Lactate = Lactate / Total)
+
+plot_data <- plot_data[plot_data$CellType %in% c("AC-like", "OPC-like"), ]
+
+plot <- ggtern(plot_data, aes(x = Glycolysis, y = Krebs, z = Lactate, fill = CellType)) +
+  stat_density_tern(aes(alpha = ..level..), geom = "polygon", color = NA) + 
+  stat_density_tern(aes(color = CellType), geom = "path", size = 0.5, alpha = 0.9) + 
+  labs(
+    x = "Glycolysis",
+    y = "Krebs",
+    z = "Lactate"
+  ) +
+  theme_classic() +
+  theme_arrowlong() + 
+  scale_fill_manual(values = colours_comb) +   
+  scale_color_manual(values = colours_comb) +    
+  scale_alpha_continuous(range = c(0.2, 0.95)) +  
+  theme(
+    axis.title = element_text(size = 8),       
+    axis.text = element_text(size = 5),        
+    strip.text = element_text(size = 10),     
+    plot.title = element_text(size = 12, face = "bold")
+  )
+```
+
+
+
