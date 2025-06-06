@@ -39,6 +39,11 @@ All original code pertaining to analysis for the study is organised in the follo
 ### - Epigenetic: Histone Modifications LC-MS
 ### - Immunofluorescence
 
-Data availability statement accessible via publication.
+Data Availability
+Study‐level clinical and spatial data from this study will be made available upon reasonable request to the lead authors from a qualified medical or scientific professional for the specific purpose laid out in that request and may include deidentified individual participant data (requests evaluated within 4 weeks). The data for this request will be available after a data access agreement has been signed. Further translational data is available from dbGAP under accession code phs003976 after provision of IRB ethics approval and the snRNA-seq data for the independent LGG cohort is available at GEO under accession code GSE292732. Data for the matched spatial transcriptomics and metabolomics data from sequential sections of the same LGG tumor is available at BioImage Archive via DOI: 10.6019/S-BIAD1426.  
+
+Publicly available data from Spitzer et al. 2024 is available at GEO under the accession number GSE26099 under the terms and conditions specified by the data provider. Single-cell sequencing reads were aligned and quantified using the GRCh38 human reference genome (2020-A), a pre-built reference package provided by 10x Genomics (GENCODEv32/Ensembl98). The reference package is available at: https://www.10xgenomics.com/support/software/cell-ranger/latest/release-notes/cr-reference-release-notes#2020-a. 
+
+WGS reads were aligned using the hg38 reference available at DRAGEN Illumina: https://sapac.support.illumina.com/downloads/dragen-reference-genomes-hg38.html. 
 
 Any additional information required to reanalyze the data reported in the study is available from the lead contact upon request. 
